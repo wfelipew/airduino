@@ -3,15 +3,15 @@
 // Receiver -> left
 // screen -L /dev/ttyUSB0 38400;  mv screenlog.0 Documents/drone-datalog.csv
 
-#include <PinChangeInterrupt.h>
+//#include <PinChangeInterrupt.h>
 #include <Servo.h>
 #include <ServoInput.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
 #include "I2Cdev.h"
-#include "MPU6050_6Axis_MotionApps20.h"
-
+#include "MPU6050_6Axis_MotionApps20_light.h"
+// #include "MPU6050_6Axis_MotionApps612.h"
 
 #define MPU6050_ADDRESS 0x68
 #define INTERRUPT_PIN 2 //MPU6050 Interrupt pin
@@ -69,7 +69,7 @@ int engineSpeed = testSpeed;
 
 // MPU control/status vars
 bool dmpReady = false;  // set true if DMP init was successful
-uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
+// uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
 uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
 uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
 uint16_t fifoCount;     // count of all bytes currently in FIFO
@@ -90,20 +90,20 @@ float gyro_offset[3];
 VectorFloat gravity;    // [x, y, z]            gravity vector
 
 // Timers
-unsigned long debug_delay,loop_timer;
+unsigned long loop_timer;
 
 // Status
-int buttonState ;
-bool setupDone=false, engineOn=false;
+// int buttonState ;
+// bool setupDone=false, engineOn=false;
 volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
 
 // Control
-int incomingByte = 0;
+// int incomingByte = 0;
 int pitchAngle = 0, rollAngle=0;
 ServoInputPin<3> rf_throttle;
 ServoInputPin<A1> rf_pitch;
 // ServoInputPin<12> rf_roll;
-ServoInputPin<A2> rf_roll;
+ServoInputPin<A7> rf_roll;
 // PID
 float pid_p_roll, pid_i_roll, pid_d_roll, pid_roll_output, roll_error, roll_error_previous;
 float pid_p_yaw, pid_i_yaw, pid_d_yaw, pid_yaw_output, yaw_error, yaw_error_previous;
@@ -131,6 +131,7 @@ void setup() {
 
   // Start serial communication, we use it to communicate to the HC-05 bluetooth module
   Serial.begin(115200);
+  Serial.println("Starting");
   //Serial.begin(2400);
 
   // REENABLE Serial.println("ESC attached");
@@ -138,7 +139,7 @@ void setup() {
   // Start I2C communication
   Wire.begin();
   Wire.setClock(400000);
-  Wire.setWireTimeout(3000, true); 
+  //Wire.setWireTimeout(3000, true); //CHECAR
 
   // Setup MPU6050
   mpu.initialize();
@@ -170,7 +171,7 @@ void setup() {
       // REENABLE Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
       // REENABLE Serial.println(F(")..."));
       attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
-      mpuIntStatus = mpu.getIntStatus();
+      // mpuIntStatus = mpu.getIntStatus();
 
       // set our DMP Ready flag so the main loop() function knows it's okay to use it
       // REENABLE Serial.println(F("DMP ready! Waiting for first interrupt..."));
@@ -183,9 +184,10 @@ void setup() {
       // 1 = initial memory load failed
       // 2 = DMP configuration updates failed
       // (if it's going to break, usually the code will be 1)
-      Serial.print(F("DMP Initialization failed (code "));
+      Serial.print(("DMP Initialization failed (code "));
       Serial.print(devStatus);
       Serial.println(F(")"));
+      while(1);      
   }  
   
   //Get gyro offset
@@ -209,43 +211,39 @@ void setup() {
   gyro_offset[1] = samples[1] / samples_count;
   gyro_offset[2] = samples[2] / samples_count;
 
-  setupDone=true;
+  // setupDone=true;
   // REENABLE Serial.print("Starting\n");
   // Serial.print("Pitch Gyro, Roll Gyro, Yaw Gyro, Pitch Angle, Roll Angle, Yaw angle, Desired Speed, Pitch Error, Roll Error, Yaw Error, Speed Rear Left, Speed Rear Right,	Speed Front Left, Speed Front Right, i_pitch, i_roll, i_yaw");
   Serial.print("\n");
 
   //Setup SD card
   if(!SD.begin(4)){
-    // Serial.println("SD initialization failed!");
-    while(1);
+    Serial.println(F("SD initialization failed!"));
+    while(1); // voltar
   }else{}
   // Serial.println("SD initialization done.");
 
   //Open flight record file
-  fdr_file = SD.open("fdr.csv",FILE_WRITE);
-  
+  fdr_file = SD.open("fdr3.csv",FILE_WRITE);
+  fdr_file.println("gyro_pitch,gyro_roll,gyro_yaw,angle_pitch,angle_roll,angle_yaw,throttle,stick_pitch,stick_roll,error_pitch,error_roll,error_yaw,leftRear,rightRear,leftFront,rightFront,pid_i_pitch,pid_i_roll,pid_i_yaw");
+  fdr_file.flush();    
+  // pinMode(A7, INPUT_PULLUP);
+  // pinMode(LED_BUILTIN, OUTPUT);
 }
 
 void loop() {
-  
   if (!dmpReady) return;  // If the MPU6050 DMP is not ready do not turn the engine on
   buf="";
-  
+  // digitalWrite(LED_BUILTIN, HIGH);
   if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
       mpu.dmpGetQuaternion(&q, fifoBuffer);
       mpu.dmpGetGravity(&gravity, &q);
       mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);      
-      // ypr[1]*=-1; // AQUI TESTANDO INVERTER
-      // ypr[2]*=-1; // AQUI TESTANDO INVERTER
-      
-      
+     
       mpu.dmpGetGyro(gyro, fifoBuffer);
       gyro[1]*=-1; // AQUI TESTANDO INVERTER
-      // gyro[0]*=-1; // AQUI TESTANDO INVERTER
 
       if( ! (abs(gyro[0]) > 180 || abs(gyro[1]) > 180 || abs(gyro[2]) > 180)  ){
-
-      
 
         gyro[0]-=gyro_offset[0];
         gyro[1]-=gyro_offset[1];
@@ -256,109 +254,109 @@ void loop() {
         gyro_filtered[2]= (int16_t) ( (0.8 * gyro_filtered[2])  + (0.2 * gyro[2]) );
 
       }
-      // Serial.print("ypr\t");
-      // Serial.print(ypr[0] * 180/M_PI);
-      // Serial.print("\t");
 
-      // Serial.println(ypr[2] * 180/M_PI);          
   }
-  // Serial.print(ypr[1] * 180/M_PI);
-  // Serial.print(",");
 
-  // buf += F("GyroPitch:");
+
   buf += String(gyro_filtered[1] );
   buf += F(",");
 
-  // buf += F("GyroRoll:");
   buf += String(gyro_filtered[0] );
   buf += F(",");
 
-  // buf += F("GyroYaw:");
   buf += String(gyro_filtered[2] );
   buf += F(",");
 
-  // buf += F("Pitch:");
   buf += String(ypr[1] * 180/M_PI,3);
   buf += F(",");
 
-  // Serial.print(ypr[2] * 180/M_PI);
-  // Serial.print(",");
-  // buf += F("Roll:");
   buf += String(ypr[2] * 180/M_PI,3);
   buf += F(",");
   
-  // Serial.print(ypr[0] * 180/M_PI);
-  // Serial.print(",");
-  // buf += F("Yaw:");
   buf += String(ypr[0] * 180/M_PI,3);
   buf += F(",");
-  
-    //int potValue = analogRead(pinPot);
-    //engineSpeed = map(potValue,0,1023,0,50);    
-    //engineSpeed = 25;
 
-  // engineSpeed = map(rf_throttle.getAngle(),2,178,0,180);
   engineSpeed = (0.8 * engineSpeed) +  (0.2 * map(rf_throttle.getAngle(),2,178,0,180));
-  // pitchAngle = map(rf_pitch.getAngle(),90,180,0,20);    
   pitchAngle = (0.8 * pitchAngle) + (-0.2 * map(rf_pitch.getAngle(),90,180,0,90)) ;
-  // pitchAngle*=-1;      
   rollAngle = (0.8 * rollAngle) + (0.2 * map(rf_roll.getAngle(),90,180,0,90));
 
+    
+  if(pitchAngle <=3 && pitchAngle >= -3){
+    pitchAngle=0;
+  }
+
+  if(rollAngle <=3 && rollAngle >= -3  ){
+    rollAngle=0;
+  }
   
-  // boolean testservo;
-  // testservo = rf_throttle.available();
-  // buf += F("######");
-  // buf += String(testservo);
-  // buf += F("######");          
   if(engineSpeed<3){
     disableEngines();
   }else{
+    // if(!fdr_file){
+    //   fdr_file = SD.open("fdr3.csv",FILE_WRITE);
+    // }
     enableEngines();
   }
    
   if(engineSpeed<0){
     engineSpeed=0;
   }
-    
-  // sprintf(result, "%d", engineSpeed);
-  // //Serial.print("Engine Speed:");
-  // Serial.print(result);
-  // Serial.print(",");
-  // buf += F("EngineSpeed:");
+
   buf += String(engineSpeed);
   buf += F(",");
-         
-  // sprintf(result, "%d", pitchAngle);
-  // //Serial.print("Desired pitchAngle:");
-  // Serial.print(result);
-  // Serial.print(",");
-  // buf += F("JoystickPitch:");
+
   buf += String(pitchAngle);
   buf += F(",");
 
   buf += String(rollAngle);
   buf += F(",");
 
-
   setAllEnginesSpeed(engineSpeed);
-    
   
-  
-  while(micros() - loop_timer < 4000 );                                      //We wait until 4000us are passed.
+  while(micros() - loop_timer < 4000 );                                      //We wait until 4000us are passed. // VOLTAR
+  // while(micros() - loop_timer < 1000000 );                                      //We wait until 4000us are passed.
   loop_timer = micros();
-  // fdr_file.println(buf);
+
   Serial.print(buf);
+
   Serial.print("\n");
+  digitalWrite(LED_BUILTIN, LOW);
+  //fdr_file.println(",");
+  // fdr_file.write(String(engineSpeed)+","+String(pitchAngle)+","+String(rollAngle));
+  // fdr_file.print(",");
+  // fdr_file.print(pitchAngle);
+  // fdr_file.print(",");
+  // fdr_file.print(rollAngle);
+  // fdr_file.print(",");
+  // fdr_file.print(ypr[1]);
+  // fdr_file.print(",");
+  // fdr_file.print(ypr[2]);
+  // fdr_file.print(",");
+  // fdr_file.print(ypr[0]);
+  
+  Serial.println("Gravando");
+  // fdr_file.println("test123");
+  // fdr_file.println("HEADER123");
+  
+  fdr_file.println(buf);
+  
+  
 }
 
 void disableEngines(){
   esc1.detach();
   esc2.detach();
   esc3.detach();
-  esc4.detach();  
+  esc4.detach();
+  fdr_file.flush();
+  // if(fdr_file){
+  //   fdr_file.flush();
+  //   fdr_file.close();
+  // }        
 }
 
 void enableEngines(){
+ 
   if(!esc1.attached()){
     esc1.attach(pinESC1,1000,2000);
   }
@@ -380,74 +378,37 @@ void enableEngines(){
 void setAllEnginesSpeed(int speed){
 
   int leftRear,rightRear,leftFront,rightFront; 
-  //Serial.print("\tPITCH: :\t");print(ypr[1]);
 
   if(speed > 90){
     speed = 90;
   }
 
-  
-
-  // pitch_gyro_desired = ( pitchAngle - (int)(ypr[1] * 180/M_PI)  ) * 5;
-  
-  // pitch_gyro_desired = ( pitchAngle - ((int)(ypr[1] * 180/M_PI)*3) );
   pitch_gyro_desired = ( pitchAngle - ((ypr[1] * 180/M_PI)*3) );
-  
-  // pitch_gyro_desired = ( 0 - (int)(ypr[1] * 180/M_PI)  ) * 5;
-  // roll_gyro_desired =  ( pitchAngle - (int)(ypr[2] * 180/M_PI)  ) * 5;
-  
-  // roll_gyro_desired =  ( 0 - ((int)(ypr[2] * 180/M_PI)*3) );
   roll_gyro_desired =  ( rollAngle - ((ypr[2] * 180/M_PI)*3) );
-  
-  // roll_gyro_desired =  ( 0 - (int)(ypr[2] * 180/M_PI)  ) * 5;
-  
-  // min 5 degres dead band
-  // if((int)(ypr[1] * 180/M_PI) > -5 && (int)(ypr[1] * 180/M_PI) <5 ){
-  //   pitch_gyro_desired = 0;
-  // }
 
-  // yaw_gyro_desired = ( 0 - (int)(ypr[0] * 180/M_PI) ) * 1;
+
+
   yaw_gyro_desired = 0;
 
   pitch_error = pitch_gyro_desired - gyro_filtered[1];
   roll_error  = roll_gyro_desired - gyro_filtered[0];
   yaw_error = yaw_gyro_desired - gyro_filtered[2];
-  
-  //  Try a deadband
-  // if( pitch_error >= -1 && pitch_error <= 1  ){
-  //     pitch_error=0;
-  // }
-  // if( roll_error >= -1 && roll_error <= 1  ){
-  //     roll_error=0;
-  // }
+
   if( yaw_error >= -1 && yaw_error <= 1  ){
       yaw_error=0;
   }
-  
-  // sprintf(result, "%d", pitch_error);
-  // Serial.print(result);
-  // Serial.print(",");
-  //buf += String(pitch_error,3);
-  // buf += F("PitchError:");
+
   buf += String(pitch_error);
   buf += F(",");
 
-  // sprintf(result, "%d", roll_error);
-  // Serial.print(result);
-  // Serial.print(",");
-  // buf += F("RollError:");
   buf += String(roll_error,3);
   buf += F(",");    
 
-  // sprintf(result, "%d", yaw_error);
-  // Serial.print(result);
-  // Serial.print(",");
-  // buf += F("YawError:");
   buf += String(yaw_error,3);
   buf += F(",");
           
   if(speed >= 15){
-    //pitch_error = abs(pitch_error);
+    
     // Calculate  pid_pitch_output 
     pid_p_pitch  = pitch_error * PID_P_GAIN_PITCH;
     pid_i_pitch  += pitch_error * PID_I_GAIN_PITCH;
@@ -504,15 +465,7 @@ void setAllEnginesSpeed(int speed){
     }
     yaw_error_previous = yaw_error;
   }
-
-
-
-
-  // leftRear = speed - pid_pitch_output + pid_roll_output - pid_yaw_output;
-  // rightRear = speed - pid_pitch_output - pid_roll_output + pid_yaw_output;
-  // leftFront= speed + pid_pitch_output + pid_roll_output + pid_yaw_output;
-  // rightFront = speed + pid_pitch_output - pid_roll_output - pid_yaw_output;
-  
+ 
   leftRear = speed +   ((-pid_pitch_output + pid_roll_output - pid_yaw_output)*0.18);
   rightRear = speed +  ((-pid_pitch_output - pid_roll_output + pid_yaw_output)*0.18);
   leftFront= speed +   ((pid_pitch_output + pid_roll_output + pid_yaw_output)*0.18);
@@ -560,56 +513,38 @@ void setAllEnginesSpeed(int speed){
   }
 
   //Rear engines
-  // esc1.write(0);//Left
   esc1.write(leftRear);//Left
-  //Serial.print("Left Right:");
-  // Serial.print(leftRear);
-  // Serial.print(",");
-  // buf += F("LeftRear:");
+
   buf += String(leftRear);
   buf += F(",");
-  
-  
-  // esc2.write(0);//Right
+
   esc2.write(rightRear);//Right
-  //Serial.print("\tRear Right:");
-  // Serial.print(rightRear);
-  // Serial.print(",");
-  // buf += F("RightRear:");
+
   buf += String(rightRear);
   buf += F(",");
   
   //Front engines
-  
-  // esc3.write(0);//Left
   esc3.write(leftFront);//Left
-  //Serial.print("\tFront Left:");
-  // Serial.print(leftFront);
-  // Serial.print(",");
-  // buf += F("LeftFront:");
+  
   buf += String(leftFront);
   buf += F(",");
   
-  // esc4.write(0);//Right
   esc4.write(rightFront);//Right
-  //Serial.print("\tFront Right:");
-  // Serial.print(rightFront);
-  //Serial.print(",");
-  // buf += F("RightFront:");
+    
   buf += String(rightFront);
   buf += F(",");  
 
-  // buf += F("pid_i_pitch:");
+  
   buf += String(pid_i_pitch);
   buf += F(",");
 
-  // buf += F("pid_i_roll:");
+  
   buf += String(pid_i_roll);
   buf += F(",");  
   
-  // buf += F("pid_i_yaw:");
+  
   buf += String(pid_i_yaw);
-  // buf += F(",");  
+   
 }
 
 
