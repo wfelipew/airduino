@@ -45,12 +45,13 @@ Wire.begin(); -> // Wire.begin();
 /*
 Todo list:
 - Tune PID parameters
-- Add battery voltage reading and compensation
-- Add yaw control
+- Detect RC signal lost (DONE)
+- Add battery voltage reading and compensation (DONE)
+- Add yaw control (DONE)
+- ON/OFF switch from RC (DONE)
 - Check if there is realiable (async) way to write to the flight data to sdcard
 - Check if doable to send telemetry over wifi
 - Add barometer to control altitude
-- How to improve the yaw control
 - Add GPS control
 - Add colision sensors
 - Calculate the lift force
@@ -84,12 +85,13 @@ Evaluate list:
 #define pinESC4 10
 #define pinButton 3
 #define pinBattery A2
+#define pinBatteryLED A3
 
 #define testSpeed 0
 
 #define PID_ANGLE_AMP 3
 #define PID_MIN_SPEED_THRESHOLD 1100
-#define PID_TAKEOFF_THRESHOLD 1200
+#define PID_TAKEOFF_THRESHOLD 1100
 #define MAX_RATE_SETPOINT_DPS 164
 
 #define SPEED_LIMIT_RAW 1800
@@ -102,31 +104,34 @@ Evaluate list:
 
 #define PID_P_GAIN_PITCH 1.3 //0.8
 #define PID_I_GAIN_PITCH 0.04 //0.004
-#define PID_D_GAIN_PITCH 18//15 8 12
+#define PID_D_GAIN_PITCH 14//15 8 12
 
 #define PID_P_GAIN_ROLL 1.3 //0.8
 #define PID_I_GAIN_ROLL 0.04 //0.004 // 0.002 was ok , por regra de 3 deveria se 0.012 <- testar
-#define PID_D_GAIN_ROLL 18//15 8 12
+#define PID_D_GAIN_ROLL 14//15 8 12
 
 #define PID_P_GAIN_YAW 3 // 1
 #define PID_I_GAIN_YAW 0.01 //0.02//0.002//0.02
 #define PID_D_GAIN_YAW 0
 
 
-#define PID_I_MAX 350 //150
-#define PID_I_YAW_MAX 100 //150
+#define PID_I_MAX 400 //150
+#define PID_I_YAW_MAX 150 //150
 #define PID_YAW_MAX 250 //150
 
 #define REFERENCE_VOLTAGE  3.3    // Nano 33 IoT logic level
 #define BATTERY_R1  10000.0
 #define BATTERY_R2  2000.0
 
+#define RC_MISSING_THRESHOLD 50
+
+#define STATE_OFF 0
+#define STATE_STARTING 1
+#define STATE_ON 2
+
+
 Madgwick filter;
 
-// Servo esc1;
-// Servo esc2;
-// Servo esc3;
-// Servo esc4;
 SAMD_PWM* esc1;
 SAMD_PWM* esc2;
 SAMD_PWM* esc3;
@@ -135,9 +140,13 @@ SAMD_PWM* esc4;
 const int SDA_PIN = A4; 
 const int SCL_PIN = A5;
 
+int rc_missing_count = 0;
+int stick_arm_count = 0;
 int engineSpeed = 1000;
 int engineSpeed_raw = 1000;
 int previous_engineSpeed_raw = 1000;
+int master_state = STATE_OFF;
+bool gyroCalibrationDone = false;
 
 int batteryADCRaw = 0;
 float batteryADC = 0;
@@ -189,6 +198,8 @@ struct log {
   int leftFront;
   int rightFront;
   float batteryVin;
+  bool rcLost;
+  int master_state;
 } flightLog;
 
 // Timers
@@ -224,20 +235,12 @@ File fdr_file;
 void setup() {
 
   // The first thing to do is attach to the esc's
-  // esc1.attach(pinESC1,1000,2000);
-  // esc2.attach(pinESC2,1000,2000);
-  // esc3.attach(pinESC3,1000,2000);
-  // esc4.attach(pinESC4,1000,2000);
   esc1 = new SAMD_PWM(pinESC1, 250.0f, 25.0f);
   esc2 = new SAMD_PWM(pinESC2, 250.0f, 25.0f);
   esc3 = new SAMD_PWM(pinESC3, 250.0f, 25.0f);
   esc4 = new SAMD_PWM(pinESC4, 250.0f, 25.0f);
 
-  // And then set it the esc to 0 to arm the engines
-  // esc1.write(1000);
-  // esc2.write(1000);
-  // esc3.write(1000);
-  // esc4.write(1000);
+  // And then set it the esc to 1000 to arm the engines
   esc1->setPWM(pinESC1,250.0f,1000/40.0f);
   esc2->setPWM(pinESC2,250.0f,1000/40.0f);
   esc3->setPWM(pinESC3,250.0f,1000/40.0f);
@@ -257,7 +260,8 @@ void setup() {
   // Battery stuff
   analogReadResolution(12);
   batteryADC = (float)analogRead(pinBattery);
- 
+  pinMode(pinBatteryLED, OUTPUT);
+  
 
   // Start I2C communication
   Wire.begin();
@@ -379,10 +383,6 @@ void loop() {
     gx_dps *=-1;
   #endif
 
-
-  // gy_dps *=-1;
-  // gx_dps *=-1;
-
   if( ! (abs(gx_dps) > 400 || abs(gy_dps) > 400 || abs(gz_dps) > 400)  ){
     gyro_filtered[0]= ( (0.7 * gyro_filtered[0])  + (0.3 * gx_dps) );
     gyro_filtered[1]= ( (0.7 * gyro_filtered[1])  + (0.3 * gy_dps) );
@@ -390,18 +390,6 @@ void loop() {
 
   }
   lastGoodPacket = millis();
-
-  
-
-  // if (millis() - lastGoodPacket > 100) {  // way more than your ~5ms expected interval
-  //   #ifdef DEBUG_MODE
-  //     Serial.println("Reseting FIFO, more 100ms since last packet");
-  //   #endif
-  //   mpu.resetFIFO();
-  //   lastGoodPacket = millis(); // avoid spamming resets
-  // }
-
-
 
   last_ax_raw = ax_raw;
   last_ay_raw = ay_raw;
@@ -415,91 +403,121 @@ void loop() {
     flightLog.angle_pitch = ypr[1];
     flightLog.angle_roll = ypr[0];
     flightLog.angle_yaw = ypr[2];
-
-    // buf += String(gyro_filtered[1] );
-    // buf += F(",");
-
-    // buf += String(gyro_filtered[0] );
-    // buf += F(",");
-
-    // buf += String(gyro_filtered[2] );
-    // buf += F(",");
-
-    // buf += String(ypr[1]);
-    // buf += F(",");
-
-    // buf += String(ypr[2]);
-    // buf += F(",");
-    
-    // buf += String(ypr[0]);
-    // buf += F(",");
   #endif
 
-  engineSpeed_raw = rf_throttle.getPulse();
-  if(abs(engineSpeed_raw - previous_engineSpeed_raw) > 500){
-    engineSpeed_raw= previous_engineSpeed_raw;
+  if(!isRCSignalLost()){
+    engineSpeed_raw = rf_throttle.getPulse();
+    if(abs(engineSpeed_raw - previous_engineSpeed_raw) > 500){
+      engineSpeed_raw= previous_engineSpeed_raw;
+    }
+
+    engineSpeed = (0.8 * engineSpeed) +  (0.2 * engineSpeed_raw);
+    pitchAngle_raw = rf_pitch.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1) *-1;
+    rollAngle_raw = rf_roll.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1);
+    yawAngle_raw = rf_yaw.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1);
+
+    if(abs(pitchAngle_raw - previous_pitchAngle_raw) > 60){
+      pitchAngle_raw = previous_pitchAngle_raw;
+    }
+
+    if(abs(rollAngle_raw - previous_rollAngle_raw) > 60){
+      rollAngle_raw = previous_rollAngle_raw;
+    }
+
+    if(abs(yawAngle_raw - previous_yawAngle_raw) > 60){
+      yawAngle_raw = previous_yawAngle_raw;
+    }
+
+    pitchAngle = (0.7 * pitchAngle) + (0.3 * pitchAngle_raw);
+    rollAngle = (0.7 * rollAngle) + (0.3 * rollAngle_raw);
+    yawAngle = (0.7 * yawAngle) + (0.3 * yawAngle_raw);
+
+    previous_pitchAngle_raw = pitchAngle_raw;
+    previous_rollAngle_raw = rollAngle_raw;
+    previous_yawAngle_raw = yawAngle_raw;
+    previous_engineSpeed_raw = engineSpeed_raw;
+    flightLog.rcLost=false;
+  }else{
+    flightLog.rcLost=true;
+
+
+    pitchAngle = 0;
+    rollAngle = 0;
+    yawAngle = 0;
+
+    pitchAngle_raw=0;
+    rollAngle_raw=0;
+    yawAngle_raw=0;
+  
+    previous_pitchAngle_raw = 0;
+    previous_rollAngle_raw = 0;
+    previous_yawAngle_raw = 0;
+
+    // If lost RC in-flight start emergency land
+    if(engineSpeed >= 1039) {
+      if(rc_missing_count % 2 == 0){
+        engineSpeed--;
+        engineSpeed_raw=engineSpeed;
+        previous_engineSpeed_raw=engineSpeed_raw;
+      }
+    }
   }
-
-  engineSpeed = (0.8 * engineSpeed) +  (0.2 * engineSpeed_raw);
-  pitchAngle_raw = rf_pitch.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1) *-1;
-  rollAngle_raw = rf_roll.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1);
-  yawAngle_raw = rf_yaw.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1);
-
-  if(abs(pitchAngle_raw - previous_pitchAngle_raw) > 60){
-    pitchAngle_raw = previous_pitchAngle_raw;
-  }
-
-  if(abs(rollAngle_raw - previous_rollAngle_raw) > 60){
-    rollAngle_raw = previous_rollAngle_raw;
-  }
-
-  if(abs(yawAngle_raw - previous_yawAngle_raw) > 60){
-    yawAngle_raw = previous_yawAngle_raw;
-  }
-
-  pitchAngle = (0.7 * pitchAngle) + (0.3 * pitchAngle_raw);
-  rollAngle = (0.7 * rollAngle) + (0.3 * rollAngle_raw);
-  yawAngle = (0.7 * yawAngle) + (0.3 * yawAngle_raw);
-
-  previous_pitchAngle_raw = pitchAngle_raw;
-  previous_rollAngle_raw = rollAngle_raw;
-  previous_yawAngle_raw = yawAngle_raw;
-  previous_engineSpeed_raw = engineSpeed_raw;
 
   readBatteryVoltage();
-  
-  if(engineSpeed<1040){
+
+  //Master Switch control
+  if(master_state==STATE_OFF && engineSpeed<1040 && (MAX_RATE_SETPOINT_DPS - yawAngle ) <= 20 ){
+    stick_arm_count++;
+    if(stick_arm_count>100){
+      master_state=STATE_STARTING;
+      stick_arm_count=0;
+    }
+  }else if(master_state==STATE_STARTING ){
+    if(!gyroCalibrationDone)
+      calibrateOffset();
+
+    pid_i_pitch = 0;
+    pid_i_roll = 0;
+    pid_i_yaw = 0;
+    pitchAngle = 0; rollAngle = 0; yawAngle = 0;
+    pitchAngle_raw = 0; rollAngle_raw = 0; yawAngle_raw = 0;
+    previous_pitchAngle_raw = 0; previous_rollAngle_raw = 0; previous_yawAngle_raw = 0; 
+    rc_missing_count = 0;
+    
+    master_state=STATE_ON;
+  }else if(master_state==STATE_ON && engineSpeed<1040 && (MAX_RATE_SETPOINT_DPS +yawAngle ) <= 20 ){
+    stick_arm_count++;
+    if(stick_arm_count>100){
+      master_state=STATE_OFF;
+      stick_arm_count=0;
+    }
+  }else{
+    stick_arm_count = 0;
+  }
+
+
+  if( engineSpeed<1040 || master_state==STATE_OFF || master_state==STATE_STARTING ){
     disableEngines();
   }else{
-    // if(!fdr_file){
-    //   fdr_file = SD.open("fdr3.csv",FILE_WRITE);
-    // }
-    enableEngines();
+    setAllEnginesSpeed(engineSpeed);
   }
+
   #ifdef PRINT_PARAMETERS
     flightLog.rc_engine_speed = engineSpeed;
     flightLog.rc_pitch = pitchAngle;
     flightLog.rc_roll = rollAngle;
     flightLog.rc_yaw = yawAngle;
-
     flightLog.batteryVin = batteryVin;
-
-    // buf += String(engineSpeed);
-    // buf += F(",");
-
-    // buf += String(pitchAngle);
-    // buf += F(",");
-
-    // buf += String(rollAngle);
-    // buf += F(",");
+    flightLog.master_state = master_state;
   #endif
 
-  setAllEnginesSpeed(engineSpeed);
   #ifdef PRINT_PARAMETERS
     // Serial.print(buf);
-    if(micros() - log_timer > 100000 ){
+    // if(micros() - log_timer > 100000 ){
+    if(micros() - log_timer > 1 ){
       char buffer[100];
-      sprintf(buffer,"%f,%f,%f,%f,%f,%f,%d,%f,%f,%f,%f", flightLog.gyro_pitch,
+      sprintf(buffer,"%d,%f,%f,%f,%f,%f,%f,%d,%f,%f,%f,%f,%d", flightLog.master_state,
+                                                flightLog.gyro_pitch,
                                                 flightLog.gyro_roll,
                                                 flightLog.gyro_yaw,
                                                 flightLog.angle_pitch,
@@ -509,11 +527,12 @@ void loop() {
                                                 flightLog.rc_pitch,
                                                 flightLog.rc_roll,
                                                 flightLog.rc_yaw,
-                                                flightLog.batteryVin);
+                                                flightLog.batteryVin,
+                                                flightLog.rcLost);
       Serial.println(buffer);
       log_timer = micros();
     }
-    
+
   #endif
 
   while(micros() - loop_timer < 4000 );                                      //We wait until 4000us are passed. // VOLTAR
@@ -524,49 +543,20 @@ void loop() {
   #endif
   loop_timer = micros();
   
-
-  // digitalWrite(LED_BUILTIN, LOW);
-  
   // comment out writing to file, as it could impact on the loop frquency
   // fdr_file.println(buf);
 
 }
 
 void disableEngines(){
-  // esc1.writeMicroseconds(1000);
-  // esc2.writeMicroseconds(1000);
-  // esc3.writeMicroseconds(1000);
-  // esc4.writeMicroseconds(1000);
   esc1->setPWM(pinESC1,250.0f,1000/40.0f);
   esc2->setPWM(pinESC2,250.0f,1000/40.0f);
   esc3->setPWM(pinESC3,250.0f,1000/40.0f);
   esc4->setPWM(pinESC4,250.0f,1000/40.0f);
-  
-  //fdr_file.flush();
-  
-  // if(fdr_file){
-  //   fdr_file.flush();
-  //   fdr_file.close();
-  // }        
 }
 
 void enableEngines(){
- 
-  // if(!esc1.attached()){
-  //   esc1.attach(pinESC1,1000,2000);
-  // }
 
-  // if(!esc2.attached()){
-  //   esc2.attach(pinESC2,1000,2000);
-  // }
-
-  // if(!esc3.attached()){
-  //   esc3.attach(pinESC3,1000,2000);
-  // }
-
-  // if(!esc4.attached()){
-  //   esc4.attach(pinESC4,1000,2000);
-  // }  
 }
 
 
@@ -577,18 +567,9 @@ void setAllEnginesSpeed(int speed){
   if(speed > SPEED_LIMIT_RAW){
     speed = SPEED_LIMIT_RAW;
   }
-
-  // pitch_level_adjust = ((1.0 - LEVEL_FILTER_ALPHA) * pitch_level_adjust) + (LEVEL_FILTER_ALPHA * ypr[1] * LEVEL_GAIN_PITCH);
-  // roll_level_adjust  = ((1.0 - LEVEL_FILTER_ALPHA) * roll_level_adjust)  + (LEVEL_FILTER_ALPHA * ypr[2] * LEVEL_GAIN_ROLL);
-
-  // pitch_gyro_desired = constrain(pitchAngle - pitch_level_adjust, -MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS);
-  // roll_gyro_desired  = constrain(rollAngle  - roll_level_adjust,  -MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS);
   
   pitch_gyro_desired = constrain(( pitchAngle - ((ypr[1] * 5.0 ))),-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS);
   roll_gyro_desired =  constrain(( rollAngle - ((ypr[2] * 5.0 ))),-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS);
-
-  // pitch_gyro_desired = pitchAngle ;
-  // roll_gyro_desired =  rollAngle ;
 
   yaw_gyro_desired = yawAngle;
 
@@ -596,33 +577,26 @@ void setAllEnginesSpeed(int speed){
   roll_error  = roll_gyro_desired - gyro_filtered[0];
   yaw_error = yaw_gyro_desired - gyro_filtered[2];
 
-  // if (pitch_error >= -0.2 && pitch_error <=0.2){
-  //   pitch_error=0;
-  // }
-
-  // if (roll_error >= -0.2 && roll_error <=0.2){
-  //   roll_error=0;
-  // }
-
-  // if( yaw_error >= 1 && yaw_error <= 1  ){
-  //     yaw_error=0;
-  // }
-
   #ifdef PRINT_PARAMETERS
     flightLog.error_pitch = pitch_error;
     flightLog.error_roll = roll_error;
     flightLog.error_yaw = yaw_error;
-    // buf += String(pitch_error);
-    // buf += F(",");
-
-    // buf += String(roll_error,3);
-    // buf += F(",");    
-
-    // buf += String(yaw_error,3);
-    // buf += F(",");
   #endif
 
   if(speed >= PID_MIN_SPEED_THRESHOLD){
+
+    int throttle_headroom = speed - PID_MIN_SPEED_THRESHOLD;
+
+    if (throttle_headroom < 0) {
+        throttle_headroom = 0;
+    }
+
+    if (throttle_headroom < 400 ){
+      pid_max = throttle_headroom;
+    }else
+    {
+      pid_max = 400;
+    }
     
     // Calculate  pid_pitch_output 
     pid_p_pitch  = pitch_error * PID_P_GAIN_PITCH;
@@ -685,10 +659,10 @@ void setAllEnginesSpeed(int speed){
     pid_d_yaw = (yaw_error - yaw_error_previous) * PID_D_GAIN_YAW;
 
     pid_yaw_output = pid_p_yaw + pid_i_yaw + pid_d_yaw;
-    if (pid_yaw_output > PID_YAW_MAX) {
-        pid_yaw_output = PID_YAW_MAX;      
-    }else if(pid_yaw_output < PID_YAW_MAX * -1){
-        pid_yaw_output = PID_YAW_MAX * -1;    
+    if (pid_yaw_output > pid_max) {
+        pid_yaw_output = pid_max;      
+    }else if(pid_yaw_output < pid_max * -1){
+        pid_yaw_output = pid_max * -1;    
     }
     yaw_error_previous = yaw_error;
   }
@@ -698,13 +672,19 @@ void setAllEnginesSpeed(int speed){
   leftFront= speed +   ((pid_pitch_output + pid_roll_output + pid_yaw_output));
   rightFront = speed + ((pid_pitch_output - pid_roll_output - pid_yaw_output));
 
-  //Battery drop compensation
+  // Battery drop compensation
   if (batteryVin < 12.4f && batteryVin > 8.0f) {
     float compensation = (12.4f - batteryVin) / 35.0f;
     leftRear   += leftRear * compensation;
     rightRear  += rightRear * compensation;
     leftFront  += leftFront * compensation;
     rightFront += rightFront * compensation;
+  }
+
+  if(batteryVin < 10.5f ){
+    digitalWrite(pinBatteryLED, HIGH);
+  }else{
+    digitalWrite(pinBatteryLED, LOW);
   }
 
   if(leftRear > SPEED_MAX_OUTPUT){
@@ -952,7 +932,7 @@ void getMotion(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int16_t* gy, 
 void readBatteryVoltage(){
   // Read analog value and smooth
   batteryADCRaw = analogRead(pinBattery);
-  batteryADC = (batteryADC * 0.92) + ((float)batteryADCRaw * 0.08);
+  batteryADC = (batteryADC * 0.998f) + ((float)batteryADCRaw * 0.002f);
   
   // Convert it analog PIN volts
   batteryVinRaw = (batteryADC / 4095.0) * REFERENCE_VOLTAGE;
@@ -961,3 +941,37 @@ void readBatteryVoltage(){
   batteryVin = batteryVinRaw * ( BATTERY_R1 + BATTERY_R2 ) / BATTERY_R2;
 
 }
+
+void calibrateOffset(){
+  //Get gyro offset
+  int samples_count=2000;
+  float samples[3] = {0,0,0};
+  for(int i=0; i < samples_count; i++){
+      int16_t gx_raw, gy_raw, gz_raw;
+      getRotation(&gx_raw, &gy_raw, &gz_raw); // direct register read, independent of the DMP FIFO
+        samples[0] += gx_raw;
+        samples[1] += gy_raw;
+        samples[2] += gz_raw;
+        delay(3);
+  }
+
+  gyro_offset[0] = samples[0] / samples_count;
+  gyro_offset[1] = samples[1] / samples_count;
+  gyro_offset[2] = samples[2] / samples_count;
+
+  gyroCalibrationDone=true;
+}
+
+bool isRCSignalLost(){
+  if(!rf_throttle.available()){
+    rc_missing_count++;
+  }else{
+    rc_missing_count=0;
+  }
+    
+  if(rc_missing_count > RC_MISSING_THRESHOLD){
+    return true;
+  }
+  return false;
+}
+
