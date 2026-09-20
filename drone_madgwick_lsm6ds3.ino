@@ -41,7 +41,9 @@ Wire.begin(); -> // Wire.begin();
   #include "SparkFunLSM6DS3.h"
   LSM6DS3 myIMU(I2C_MODE, 0x6A);
 #endif
+#include <DFRobot_BMP3XX.h>
 
+bool readBarometer(bool force = false);
 /*
 Todo list:
 - Tune PID parameters
@@ -64,7 +66,9 @@ Evaluate list:
 */
 
 // #define DEBUG_MODE true
-// #define PRINT_PARAMETERS true
+#define PRINT_PARAMETERS true
+
+
 
 
 #define GYRO_RATE 2000
@@ -77,7 +81,7 @@ Evaluate list:
 
 
 #define MPU6050_ADDRESS 0x68
-#define INTERRUPT_PIN 2 //MPU6050 Interrupt pin
+#define BARO_INT_PIN 2 //MPU6050 Interrupt pin
 
 #define pinESC1 5
 #define pinESC2 6
@@ -102,17 +106,21 @@ Evaluate list:
 #define LEVEL_GAIN_PITCH 3.0
 #define LEVEL_GAIN_ROLL  3.0
 
-#define PID_P_GAIN_PITCH 1.3 //0.8
+#define PID_P_GAIN_PITCH 1.1 //1.3
 #define PID_I_GAIN_PITCH 0.04 //0.004
-#define PID_D_GAIN_PITCH 14//15 8 12
+#define PID_D_GAIN_PITCH 10//16
 
-#define PID_P_GAIN_ROLL 1.3 //0.8
+#define PID_P_GAIN_ROLL 1.1 //0.8
 #define PID_I_GAIN_ROLL 0.04 //0.004 // 0.002 was ok , por regra de 3 deveria se 0.012 <- testar
-#define PID_D_GAIN_ROLL 14//15 8 12
+#define PID_D_GAIN_ROLL 10//15 8 12
 
-#define PID_P_GAIN_YAW 3 // 1
+#define PID_P_GAIN_YAW 4 // 1
 #define PID_I_GAIN_YAW 0.01 //0.02//0.002//0.02
 #define PID_D_GAIN_YAW 0
+
+#define PID_P_GAIN_ALT 50.0  
+#define PID_I_GAIN_ALT 0.2   
+#define PID_D_GAIN_ALT 0.1
 
 
 #define PID_I_MAX 400 //150
@@ -129,6 +137,10 @@ Evaluate list:
 #define STATE_STARTING 1
 #define STATE_ON 2
 
+#define SEALEVELPRESSURE_HPA 1013.25f
+// #define SEALEVELPRESSURE_PA 101325.0f
+
+DFRobot_BMP388_I2C bmp(&Wire, bmp.eSDOGND);
 
 Madgwick filter;
 
@@ -142,11 +154,32 @@ const int SCL_PIN = A5;
 
 int rc_missing_count = 0;
 int stick_arm_count = 0;
+int toogleSwitchRaw = 1000;
 int engineSpeed = 1000;
 int engineSpeed_raw = 1000;
 int previous_engineSpeed_raw = 1000;
 int master_state = STATE_OFF;
+bool alt_hold_mode = true, previous_alt_hold_mode = true;
 bool gyroCalibrationDone = false;
+
+bool toogle_on = false;
+bool toogle_altitude_hold = false;
+
+float current_altitude = 0, previous_altitude = 0, filtered_altitude = 0, filtered_a_up_g = 0, raw_pressure =0, home_altitude=0;
+float current_vertical_speed = 0, target_vertical_speed = 0;
+float altitude_setpoint = 0, altitude_error=0;
+unsigned long last_baro_read = 0;
+volatile bool baroDataReady;
+bool baroDataReadDone = false;
+
+// Complementary filter state: fuses integrated accel with the noisy barometer
+float vvel_estimate = 0;   // fused vertical velocity, m/s (+ = up), replaces raw baro derivative
+float alt_estimate  = 0;   // fused altitude, m
+#define ALT_FUSION_KP 0.3f  // 0-1, how hard each new baro sample pulls the altitude estimate
+#define ALT_FUSION_KV 0.005f  // how hard each new baro sample pulls the velocity estimate - tune on the bench
+// #define ALT_FUSION_KV 0.03f 
+float alt_vel_error = 0, alt_vel_error_previous = 0;
+float pid_p_alt = 0, pid_i_alt = 1100, pid_d_alt = 0;
 
 int batteryADCRaw = 0;
 float batteryADC = 0;
@@ -200,25 +233,38 @@ struct log {
   float batteryVin;
   bool rcLost;
   int master_state;
+  float altitude;
+  float ground_altitude;
+  float vertical_speed;
+  float raw_pressure;
+  int toogleSwitch;
+  float rc_vspeed_raw;
+  float a_net;
+  float alt_estimate;
+  float altitude_setpoint;
+  float rc_vspeed_filtered;
 } flightLog;
 
 // Timers
 unsigned long loop_timer;
 unsigned long log_timer;
+volatile unsigned long baro_isr_micros;
 unsigned long lastGoodPacket = 0;
 
 // Status
 volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
 
 // Control
-float pitchAngle = 0, rollAngle=0, yawAngle=0;
+float pitchAngle = 0, rollAngle=0, yawAngle=0, altitudeStick=0;
 float pitch_level_adjust = 0, roll_level_adjust = 0, yaw_level_adjust = 0;
 long pitchAngle_raw = 0, rollAngle_raw = 0, yawAngle_raw = 0 ;
+float rc_vspeed_raw=0, previous_rc_vspeed_raw=0,rc_vspeed_filtered=0;
 long previous_pitchAngle_raw = 0, previous_rollAngle_raw = 0, previous_yawAngle_raw = 0 ;
 ServoInputPin<3> rf_throttle;
 ServoInputPin<A1> rf_pitch;
 ServoInputPin<A7> rf_roll;
 ServoInputPin<11> rf_yaw;
+ServoInputPin<13> rf_switch;
 
 
 // PID
@@ -251,6 +297,7 @@ void setup() {
   rf_pitch.attach();
   rf_roll.attach();
   rf_yaw.attach();
+  rf_switch.attach();
 
   // Start serial communication
   Serial.begin(230400);//115200
@@ -273,15 +320,21 @@ void setup() {
   //delay(5);
   Serial.println("Starting setup");
   setupBoard();
+  setupBarometerBoard();
   delay(5);
 
-  pinMode(INTERRUPT_PIN, INPUT);
+  pinMode(BARO_INT_PIN, INPUT);
 
   // enable Arduino interrupt detection
   Serial.print(F("Enabling interrupt detection (Arduino external interrupt "));
-  Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
+  Serial.print(digitalPinToInterrupt(BARO_INT_PIN));
   Serial.println(F(")..."));
   // attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+  attachInterrupt(
+        digitalPinToInterrupt(BARO_INT_PIN),
+        baroISR,
+        RISING
+    );
   
   delay(5);
   
@@ -324,20 +377,16 @@ void setup() {
   // fdr_file = SD.open("fdr3.csv",FILE_WRITE);
   // fdr_file.println("gyro_pitch,gyro_roll,gyro_yaw,angle_pitch,angle_roll,angle_yaw,throttle,stick_pitch,stick_roll,error_pitch,error_roll,error_yaw,leftRear,rightRear,leftFront,rightFront,pid_i_pitch,pid_i_roll,pid_i_yaw");
   // fdr_file.flush();    
-  // pinMode(A7, INPUT_PULLUP);
-  // pinMode(LED_BUILTIN, OUTPUT);
+
 }
 
 void loop() {
   buf="";
-  // digitalWrite(LED_BUILTIN, HIGH);
   
+
   int16_t gx_raw, gy_raw, gz_raw;
   int16_t ax_raw, ay_raw, az_raw;
-  
-  // mpu.dmpGetQuaternion(&q, fifoBuffer);
-  // mpu.dmpGetGravity(&gravity, &q);
-  // mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);      
+
   getMotion(&ax_raw, &ay_raw, &az_raw,&gx_raw, &gy_raw, &gz_raw);
 
   if (ax_raw == last_ax_raw && ay_raw == last_ay_raw && az_raw == last_az_raw) {
@@ -406,12 +455,90 @@ void loop() {
   #endif
 
   if(!isRCSignalLost()){
-    engineSpeed_raw = rf_throttle.getPulse();
-    if(abs(engineSpeed_raw - previous_engineSpeed_raw) > 500){
-      engineSpeed_raw= previous_engineSpeed_raw;
+
+    toogleSwitchRaw = rf_switch.getPulse();
+    flightLog.toogleSwitch = toogleSwitchRaw;
+    readToogles();
+    alt_hold_mode=toogle_altitude_hold;
+    
+    if(alt_hold_mode && !previous_alt_hold_mode){
+      pid_i_alt = constrain(rf_throttle.getPulse(), 1300, 1700);
+      last_baro_read = baro_isr_micros;
+      vvel_estimate = 0;
+      readBarometer(true);
+      readBarometer(true);
+      rc_vspeed_raw = 0;
+      previous_rc_vspeed_raw = 0;
+      rc_vspeed_filtered=0;
+      altitude_setpoint = alt_estimate;
+      
+    }
+    if(!alt_hold_mode && previous_alt_hold_mode){
+      engineSpeed = pid_i_alt;
+      previous_engineSpeed_raw = engineSpeed;
+      altitude_setpoint = alt_estimate;
     }
 
-    engineSpeed = (0.8 * engineSpeed) +  (0.2 * engineSpeed_raw);
+    previous_alt_hold_mode=alt_hold_mode;
+    if(alt_hold_mode){
+      if(baroDataReadDone){
+        baroDataReadDone=false;
+        flightLog.altitude = filtered_altitude;
+        flightLog.alt_estimate = alt_estimate;
+        flightLog.vertical_speed = current_vertical_speed;
+        if(alt_hold_mode && master_state == STATE_ON){
+          rc_vspeed_raw = ((float)rf_throttle.mapDeadzone(-2000,2000, 0.2))/ 1000.0;
+          if(abs(rc_vspeed_raw - previous_rc_vspeed_raw) > 1){
+            rc_vspeed_raw=previous_rc_vspeed_raw;
+          }
+          rc_vspeed_filtered = (rc_vspeed_filtered*0.8) + (rc_vspeed_raw*0.2);
+          flightLog.rc_vspeed_raw = rc_vspeed_raw;
+          flightLog.rc_vspeed_filtered = rc_vspeed_filtered;
+          
+          if(rc_vspeed_raw == 0 && previous_rc_vspeed_raw !=0 ){
+            altitude_setpoint = alt_estimate;
+          }
+          if(rc_vspeed_raw == 0){
+            // altitude_error = alt_estimate -  altitude_setpoint;
+            // alt_vel_error = current_vertical_speed - (altitude_error * 2);
+            altitude_error = altitude_setpoint - alt_estimate;
+            alt_vel_error = altitude_error;
+            // alt_vel_error  = (altitude_error * 2) - current_vertical_speed;
+            //Add a dead band here
+          }else{      
+            alt_vel_error = rc_vspeed_filtered - current_vertical_speed;
+          }
+          flightLog.altitude_setpoint = altitude_setpoint;
+
+          // if(abs(alt_vel_error) < 0.3){
+          //   alt_vel_error=0;
+          // }
+          
+          pid_p_alt = alt_vel_error * PID_P_GAIN_ALT;
+          pid_i_alt += alt_vel_error * PID_I_GAIN_ALT;
+          pid_i_alt = constrain(pid_i_alt, 1400, 1700);
+          pid_d_alt = (alt_vel_error - alt_vel_error_previous) * PID_D_GAIN_ALT;
+          alt_vel_error_previous = alt_vel_error;
+
+          engineSpeed = pid_i_alt + pid_p_alt + pid_d_alt;
+          engineSpeed = constrain(engineSpeed, 1000, 1700);
+
+          // if(filtered_altitude - home_altitude > 2){
+          //   engineSpeed-=50;
+          // }
+
+          // altitudeStick = 
+          previous_rc_vspeed_raw = rc_vspeed_raw;
+        }
+      }
+      
+    }else{
+      engineSpeed_raw = rf_throttle.getPulse();
+      if(abs(engineSpeed_raw - previous_engineSpeed_raw) > 500){
+        engineSpeed_raw= previous_engineSpeed_raw;
+      }
+      engineSpeed = (0.8 * engineSpeed) +  (0.2 * engineSpeed_raw);
+    }
     pitchAngle_raw = rf_pitch.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1) *-1;
     rollAngle_raw = rf_roll.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1);
     yawAngle_raw = rf_yaw.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1);
@@ -448,15 +575,19 @@ void loop() {
     pitchAngle_raw=0;
     rollAngle_raw=0;
     yawAngle_raw=0;
+    rc_vspeed_raw=0;
   
     previous_pitchAngle_raw = 0;
     previous_rollAngle_raw = 0;
     previous_yawAngle_raw = 0;
 
+    pid_i_alt = 1000;
+    // last_baro_read =0; 
+
     // If lost RC in-flight start emergency land
     if(engineSpeed >= 1039) {
       if(rc_missing_count % 2 == 0){
-        engineSpeed--;
+        engineSpeed-=2;
         engineSpeed_raw=engineSpeed;
         previous_engineSpeed_raw=engineSpeed_raw;
       }
@@ -476,9 +607,14 @@ void loop() {
     if(!gyroCalibrationDone)
       calibrateOffset();
 
+    readBarometer(true);
+    home_altitude = current_altitude;
     pid_i_pitch = 0;
     pid_i_roll = 0;
     pid_i_yaw = 0;
+    pid_i_alt = 1000;
+    alt_vel_error = 0;
+    alt_vel_error_previous = 0;
     pitchAngle = 0; rollAngle = 0; yawAngle = 0;
     pitchAngle_raw = 0; rollAngle_raw = 0; yawAngle_raw = 0;
     previous_pitchAngle_raw = 0; previous_rollAngle_raw = 0; previous_yawAngle_raw = 0; 
@@ -488,6 +624,7 @@ void loop() {
   }else if(master_state==STATE_ON && engineSpeed<1040 && (MAX_RATE_SETPOINT_DPS +yawAngle ) <= 20 ){
     stick_arm_count++;
     if(stick_arm_count>100){
+      pid_i_alt = 1000;
       master_state=STATE_OFF;
       stick_arm_count=0;
     }
@@ -502,6 +639,10 @@ void loop() {
     setAllEnginesSpeed(engineSpeed);
   }
 
+  if(alt_hold_mode){
+    readBarometer();
+  }
+
   #ifdef PRINT_PARAMETERS
     flightLog.rc_engine_speed = engineSpeed;
     flightLog.rc_pitch = pitchAngle;
@@ -509,26 +650,43 @@ void loop() {
     flightLog.rc_yaw = yawAngle;
     flightLog.batteryVin = batteryVin;
     flightLog.master_state = master_state;
+    flightLog.ground_altitude = filtered_altitude - home_altitude;
   #endif
 
   #ifdef PRINT_PARAMETERS
     // Serial.print(buf);
     // if(micros() - log_timer > 100000 ){
-    if(micros() - log_timer > 1 ){
-      char buffer[100];
-      sprintf(buffer,"%d,%f,%f,%f,%f,%f,%f,%d,%f,%f,%f,%f,%d", flightLog.master_state,
-                                                flightLog.gyro_pitch,
-                                                flightLog.gyro_roll,
-                                                flightLog.gyro_yaw,
-                                                flightLog.angle_pitch,
-                                                flightLog.angle_roll,
-                                                flightLog.angle_yaw,
+      if(true ){
+      char buffer[250];
+      // sprintf(buffer,"%d,%f,%f,%f,%f,%f,%f,%d,%f,%f,%f,%f,%d,%f,%f,%f,%d,%f,%", flightLog.master_state,
+      //                                           flightLog.gyro_pitch,
+      //                                           flightLog.gyro_roll,
+      //                                           flightLog.gyro_yaw,
+      //                                           flightLog.angle_pitch,
+      //                                           flightLog.angle_roll,
+      //                                           flightLog.angle_yaw,
+      //                                           flightLog.rc_engine_speed,
+      //                                           flightLog.rc_pitch,
+      //                                           flightLog.rc_roll,
+      //                                           flightLog.rc_yaw,
+      //                                           flightLog.batteryVin,
+      //                                           flightLog.rcLost,
+      //                                           flightLog.altitude,
+      //                                           flightLog.vertical_speed,
+      //                                           flightLog.ground_altitude,
+      //                                           flightLog.toogleSwitch,
+      //                                           flightLog.rc_vspeed_raw,
+      //                                           flightLog.a_net);
+      sprintf(buffer,"%f,%f,%f,%f,%f,%f,%d,%f,%f", 
+                                                flightLog.altitude,
+                                                flightLog.alt_estimate,
+                                                flightLog.vertical_speed,
+                                                flightLog.raw_pressure,
+                                                flightLog.a_net,
+                                                flightLog.altitude_setpoint,
                                                 flightLog.rc_engine_speed,
-                                                flightLog.rc_pitch,
-                                                flightLog.rc_roll,
-                                                flightLog.rc_yaw,
-                                                flightLog.batteryVin,
-                                                flightLog.rcLost);
+                                                flightLog.rc_vspeed_raw,
+                                                flightLog.rc_vspeed_filtered);
       Serial.println(buffer);
       log_timer = micros();
     }
@@ -727,15 +885,10 @@ void setAllEnginesSpeed(int speed){
   }
 
   //Rear engines
-  // esc1.writeMicroseconds(leftRear);//Left 
-  // esc2.writeMicroseconds(rightRear);//Right
   esc1->setPWM(pinESC1,250.0f,leftRear/40.0f);
   esc2->setPWM(pinESC2,250.0f,rightRear/40.0f);
 
-
   //Front engines
-  // esc3.writeMicroseconds(leftFront);//Left  
-  // esc4.writeMicroseconds(rightFront);//Right
   esc3->setPWM(pinESC3,250.0f,leftFront/40.0f);
   esc4->setPWM(pinESC4,250.0f,rightFront/40.0f);
 
@@ -749,26 +902,7 @@ void setAllEnginesSpeed(int speed){
     flightLog.rightRear = rightRear;
     flightLog.leftFront = leftFront;
     flightLog.rightFront = rightFront;
-    
-    // buf += String(leftRear);
-    // buf += F(",");
 
-    // buf += String(rightRear);
-    // buf += F(",");
-
-    // buf += String(leftFront);
-    // buf += F(",");
-      
-    // buf += String(rightFront);
-    // buf += F(",");  
-
-    // buf += String(pid_i_pitch);
-    // buf += F(",");
-    
-    // buf += String(pid_i_roll);
-    // buf += F(",");  
-      
-    // buf += String(pid_i_yaw);
   #endif
    
 }
@@ -811,6 +945,41 @@ void resetWire(){
   Wire.setClock(400000);
 }
 
+void setupBarometerBoard(){
+  //temp disable
+  // return;
+  if (bmp.begin()!=ERR_OK) {
+    Serial.println("Could not find a valid BMP3 sensor, check wiring!");
+    while(1);
+  } else {
+    Serial.println("BMP3XX Barometer initialized successfully!");
+    bool ok = bmp.setSamplingMode(bmp.eNormalPrecision2);
+
+    if(ok){
+      Serial.println("BMP Samp Config OK");
+    }else{
+      Serial.println("BMP Samp Config Failed");
+      while(1);
+    }
+    Serial.println("BMP Samp period");
+    Serial.println(bmp.getSamplingPeriodUS());
+
+    bmp.setINTMode(
+        bmp.eINTPinPP |
+        bmp.eINTPinActiveLevelHigh |
+        // bmp.eINTLatchEN |
+        bmp.eINTLatchDIS |
+        bmp.eIntFWtmDis |
+        bmp.eINTFFullDIS |
+        bmp.eINTInitialLevelLOW |
+        bmp.eINTDataDrdyEN
+    );
+    // bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
+    // bmp.setPressureOversampling(BMP3_OVERSAMPLING_8X);
+    // bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+    // bmp.setOutputDataRate(BMP3_ODR_50_HZ);
+  }
+}
 
 void setupBoard()
 {
@@ -859,9 +1028,6 @@ void setupBoard()
     accel_offset[0] = 55;
     accel_offset[1] = 74; 
     accel_offset[2] = 34;
-    // gyro_offset = {-3, 1, 2};
-    
-    // if (0 != 0) {
 
     // Make a SensorSettings object to remember what you wanted to set everyhting to
     SensorSettings settingsIWanted;
@@ -872,24 +1038,10 @@ void setupBoard()
       Serial.println(test);
       while (1); 
     }
-    // compareSettings(settingsIWanted);
-    // while (1);
-
 
   #endif
 
-
-
 }
-
-// void compareSettings(SensorSettings desiredSettings){
-//   if(myIMU.settings.accelBandWidth != desiredSettings.accelBandWidth )    { Serial.println("'accelBandWidth' was changed!"); }
-//   if(myIMU.settings.accelRange != desiredSettings.accelRange )            { Serial.println("'accelRange' was changed!"); }
-//   if(myIMU.settings.accelSampleRate != desiredSettings.accelSampleRate )  { Serial.println("'accelSampleRate' was changed!"); }
-//   if(myIMU.settings.gyroRange != desiredSettings.gyroRange )              { Serial.println("'gyroRange' was changed!"); }
-//   if(myIMU.settings.gyroSampleRate != desiredSettings.gyroSampleRate )    { Serial.println("'gyroSampleRate' was changed!"); }
-//   Serial.println("Device config ok.");
-// }
 
 void getRotation(int16_t* x, int16_t* y, int16_t* z){
   #if IMU_BOARD == MPU6050_BOARD
@@ -932,7 +1084,7 @@ void getMotion(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int16_t* gy, 
 void readBatteryVoltage(){
   // Read analog value and smooth
   batteryADCRaw = analogRead(pinBattery);
-  batteryADC = (batteryADC * 0.998f) + ((float)batteryADCRaw * 0.002f);
+  batteryADC = (batteryADC * 0.999f) + ((float)batteryADCRaw * 0.001f);
   
   // Convert it analog PIN volts
   batteryVinRaw = (batteryADC / 4095.0) * REFERENCE_VOLTAGE;
@@ -975,3 +1127,100 @@ bool isRCSignalLost(){
   return false;
 }
 
+bool readBarometer(bool force){
+  //temp disable
+  // return false;
+  if(baroDataReady || force){
+    //  Serial.println("Barometer Ready");
+    baroDataReady = false;
+    unsigned long current_time = baro_isr_micros;
+    if (last_baro_read == 0) {
+      last_baro_read = current_time;
+      filtered_altitude = bmp.readAltitudeM();
+      previous_altitude = filtered_altitude;
+      alt_estimate = filtered_altitude;
+      vvel_estimate = 0;
+      return false;
+    }
+    float dt_baro = (current_time - last_baro_read) / 1000000.0f;
+    last_baro_read = current_time;
+    if (dt_baro <= 0.001f) return false;
+    
+    current_altitude = bmp.readAltitudeM(); // This to heavy for Arduino NANO IOT
+    #ifdef PRINT_PARAMETERS
+      raw_pressure = bmp.readPressPa() / 100;
+      flightLog.raw_pressure= raw_pressure;
+    #endif
+    // float raw_pressure = 0;
+    // current_altitude = (SEALEVELPRESSURE_PA - raw_pressure) / 8.3f;
+    // current_altitude = 0;
+
+    filtered_altitude =  (filtered_altitude * 0.85) + (current_altitude * 0.15);
+    // filtered_altitude =  (filtered_altitude * 0.7) + (current_altitude * 0.3);
+
+    // float baro_velocity = (filtered_altitude - previous_altitude) / dt_baro;
+    previous_altitude = filtered_altitude;
+
+        // ---- Predict: integrate tilt-compensated vertical acceleration over dt_baro ----
+    // Rotates the body-frame accelerometer reading into the earth vertical axis using
+    // the current Madgwick pitch/roll, so the drone's own tilt isn't mistaken for climb/descent.
+    float pitch_rad = radians(ypr[1]);
+    float roll_rad  = radians(ypr[2])*-1;
+    float a_up_g =  ax_gf * (-sin(pitch_rad))
+                  + ay_gf * ( sin(roll_rad) * cos(pitch_rad))
+                  + az_gf * ( cos(roll_rad) * cos(pitch_rad));
+    // NOTE: verify this sign on the bench - az_gf should read ~+1.0g sitting level and still.
+    // If a_up_g reads ~-1.0g level instead, flip all three signs above.
+    // Checked it is around 1
+    filtered_a_up_g = (filtered_a_up_g * 0.7) + (a_up_g * 0.3);
+    float a_net = (filtered_a_up_g - 1.0f) * 9.81f;  // strip gravity -> net vertical accel, m/s^2
+    #ifdef PRINT_PARAMETERS
+      flightLog.a_net = a_net;
+      flightLog.raw_pressure= raw_pressure;
+    #endif
+
+    vvel_estimate += a_net * dt_baro;
+    alt_estimate  += vvel_estimate * dt_baro;
+
+    // ---- Correct: nudge the smooth-but-drifting accel estimate toward the noisy-but-
+    // ---- unbiased barometer reading. This is a multiply by a fixed gain, NOT a divide
+    // ---- by dt, which is what turned every bit of baro noise into m/s of fake velocity. ----
+    float alt_error = filtered_altitude - alt_estimate;
+    alt_estimate  += ALT_FUSION_KP * alt_error;
+    // vvel_estimate += ALT_FUSION_KV * alt_error;
+    vvel_estimate += (ALT_FUSION_KV * alt_error)  / dt_baro;
+
+    current_vertical_speed = vvel_estimate;
+    // current_vertical_speed = (current_vertical_speed * 0.85) + (baro_velocity * 0.15);
+    // current_vertical_speed = baro_velocity;
+    baroDataReadDone=true;
+    return true;
+  }
+  return false;
+}
+
+void baroISR()
+{
+    //  Serial.println("Barometer Ready");
+    baro_isr_micros = micros();
+    baroDataReady = true;
+}
+
+void readToogles(){
+
+  if (toogleSwitchRaw > 900 && toogleSwitchRaw < 1200) {
+  toogle_altitude_hold = false; toogle_on  = false; // Both UP
+  } 
+  else if (toogleSwitchRaw >= 1200 && toogleSwitchRaw < 1500) {
+    toogle_altitude_hold = true;  toogle_on  = false; // SwA DOWN, SwB UP
+  } 
+  else if (toogleSwitchRaw >= 1500 && toogleSwitchRaw < 1800) {
+    toogle_altitude_hold = false; toogle_on  = true;  // SwA UP, SwB DOWN
+  } 
+  else if (toogleSwitchRaw >= 1800) {
+    toogle_altitude_hold = true;  toogle_on  = true;  // Both DOWN
+  }else{
+    toogle_altitude_hold = false; toogle_on  = false;
+  }
+
+}
