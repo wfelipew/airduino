@@ -66,8 +66,8 @@ Evaluate list:
 */
 
 // #define DEBUG_MODE true
-#define PRINT_PARAMETERS true
-
+// #define PRINT_PARAMETERS true
+// #define TEST_ENGINES true
 
 
 
@@ -83,10 +83,11 @@ Evaluate list:
 #define MPU6050_ADDRESS 0x68
 #define BARO_INT_PIN 2 //MPU6050 Interrupt pin
 
-#define pinESC1 5
-#define pinESC2 6
-#define pinESC3 9
-#define pinESC4 10
+#define pinESC1 5 //leftRear
+#define pinESC2 6 //rightRear
+#define pinESC3 9 //leftFront
+#define pinESC4 10 //rightFront
+
 #define pinButton 3
 #define pinBattery A2
 #define pinBatteryLED A3
@@ -140,7 +141,8 @@ Evaluate list:
 #define SEALEVELPRESSURE_HPA 1013.25f
 // #define SEALEVELPRESSURE_PA 101325.0f
 
-DFRobot_BMP388_I2C bmp(&Wire, bmp.eSDOGND);
+// DFRobot_BMP388_I2C bmp(&Wire, bmp.eSDOGND);
+DFRobot_BMP388_I2C bmp(&Wire, bmp.eSDOVDD);
 
 Madgwick filter;
 
@@ -208,6 +210,9 @@ float gyro_filtered[3];  //
 float gyro_offset[3];
 int16_t gyro_internal_offset[3];
 float accel_offset[3];
+
+uint16_t telemetry_counter = 0;
+bool telemetry_enabled = true;
 
 struct log {
   float gyro_pitch;
@@ -292,15 +297,24 @@ void setup() {
   esc3->setPWM(pinESC3,250.0f,1000/40.0f);
   esc4->setPWM(pinESC4,250.0f,1000/40.0f);
 
+  #ifdef TEST_ENGINES
+    testEngines();
+    while(true);
+  #endif
+
   // Attach the servo inputs
   rf_throttle.attach();
   rf_pitch.attach();
   rf_roll.attach();
   rf_yaw.attach();
   rf_switch.attach();
+  
 
   // Start serial communication
   Serial.begin(230400);//115200
+  // Start HC-05 serial comm
+  Serial1.begin(57600);
+  // Serial1.begin(9600);
   // delay(8000);
   Serial.println("Starting setup");
 
@@ -317,7 +331,7 @@ void setup() {
   // Wire.setWireTimeout(3000, true); //Only available on AVR based arduino
 
   // Setup IMU Board
-  //delay(5);
+  // delay(10000);
   Serial.println("Starting setup");
   setupBoard();
   setupBarometerBoard();
@@ -446,12 +460,12 @@ void loop() {
 
   #ifdef PRINT_PARAMETERS
     flightLog.gyro_pitch = gyro_filtered[1];
-    flightLog.gyro_roll = gyro_filtered[0];
-    flightLog.gyro_yaw = gyro_filtered[2];
+    flightLog.gyro_roll = gyro_filtered[2];
+    flightLog.gyro_yaw = gyro_filtered[0];
 
     flightLog.angle_pitch = ypr[1];
-    flightLog.angle_roll = ypr[0];
-    flightLog.angle_yaw = ypr[2];
+    flightLog.angle_roll = ypr[2];
+    flightLog.angle_yaw = ypr[0];
   #endif
 
   if(!isRCSignalLost()){
@@ -657,42 +671,49 @@ void loop() {
     // Serial.print(buf);
     // if(micros() - log_timer > 100000 ){
       if(true ){
-      char buffer[250];
-      // sprintf(buffer,"%d,%f,%f,%f,%f,%f,%f,%d,%f,%f,%f,%f,%d,%f,%f,%f,%d,%f,%", flightLog.master_state,
-      //                                           flightLog.gyro_pitch,
-      //                                           flightLog.gyro_roll,
-      //                                           flightLog.gyro_yaw,
-      //                                           flightLog.angle_pitch,
-      //                                           flightLog.angle_roll,
-      //                                           flightLog.angle_yaw,
-      //                                           flightLog.rc_engine_speed,
-      //                                           flightLog.rc_pitch,
-      //                                           flightLog.rc_roll,
-      //                                           flightLog.rc_yaw,
-      //                                           flightLog.batteryVin,
-      //                                           flightLog.rcLost,
-      //                                           flightLog.altitude,
-      //                                           flightLog.vertical_speed,
-      //                                           flightLog.ground_altitude,
-      //                                           flightLog.toogleSwitch,
-      //                                           flightLog.rc_vspeed_raw,
-      //                                           flightLog.a_net);
-      sprintf(buffer,"%f,%f,%f,%f,%f,%f,%d,%f,%f", 
-                                                flightLog.altitude,
-                                                flightLog.alt_estimate,
-                                                flightLog.vertical_speed,
-                                                flightLog.raw_pressure,
-                                                flightLog.a_net,
-                                                flightLog.altitude_setpoint,
+      char buffer[300];
+      sprintf(buffer,"%d,%f,%f,%f,%f,%f,%f,%d,%f,%f,%f,%f,%d,%f,%f,%f,%d,%f,%f", flightLog.master_state,
+                                                flightLog.gyro_pitch,
+                                                flightLog.gyro_roll,
+                                                flightLog.gyro_yaw,
+                                                flightLog.angle_pitch,
+                                                flightLog.angle_roll,
+                                                flightLog.angle_yaw,
                                                 flightLog.rc_engine_speed,
+                                                flightLog.rc_pitch,
+                                                flightLog.rc_roll,
+                                                flightLog.rc_yaw,
+                                                flightLog.batteryVin,
+                                                flightLog.rcLost,
+                                                flightLog.altitude,
+                                                flightLog.vertical_speed,
+                                                flightLog.ground_altitude,
+                                                flightLog.toogleSwitch,
                                                 flightLog.rc_vspeed_raw,
-                                                flightLog.rc_vspeed_filtered);
+                                                flightLog.a_net);
+      // sprintf(buffer,"%f,%f,%f,%f,%f,%f,%d,%f,%f", 
+      //                                           flightLog.altitude,
+      //                                           flightLog.alt_estimate,
+      //                                           flightLog.vertical_speed,
+      //                                           flightLog.raw_pressure,
+      //                                           flightLog.a_net,
+      //                                           flightLog.altitude_setpoint,
+      //                                           flightLog.rc_engine_speed,
+      //                                           flightLog.rc_vspeed_raw,
+      //                                           flightLog.rc_vspeed_filtered);
       Serial.println(buffer);
       log_timer = micros();
     }
 
   #endif
 
+  if (telemetry_enabled){
+    telemetry_counter++;
+    if (telemetry_counter >= 25 ) {
+      telemetry_counter = 0;
+      sendTelemetry();
+    }
+  }
   while(micros() - loop_timer < 4000 );                                      //We wait until 4000us are passed. // VOLTAR
   #ifdef DEBUG_MODE
     Serial.print("\nLoop Timer:");
@@ -1025,9 +1046,9 @@ void setupBoard()
     myIMU.settings.gyroSampleRate = 416;    // Keep your 260Hz ODR
     myIMU.settings.gyroBandWidth = 50;
 
-    accel_offset[0] = 55;
-    accel_offset[1] = 74; 
-    accel_offset[2] = 34;
+    accel_offset[0] = 44; //55;
+    accel_offset[1] = 40; //74; 
+    accel_offset[2] = 24; //34;
 
     // Make a SensorSettings object to remember what you wanted to set everyhting to
     SensorSettings settingsIWanted;
@@ -1224,3 +1245,123 @@ void readToogles(){
   }
 
 }
+
+
+// Sends one compact binary telemetry packet over the HC-05 (Serial1). Format:
+//   byte 0-1:  sync 0xAA 0x55
+//   byte 2-5:  uint32 millis()
+//   byte 6:    master_state
+//   byte 7:    alt_hold_mode
+//   byte 8-9:  int16  altitude_cm        (alt_estimate * 100)
+//   byte 10-11:int16  vspeed_cms         (current_vertical_speed * 100)
+//   byte 12-13:int16  altitude_sp_cm     (altitude_setpoint * 100)
+//   byte 14-15:uint16 engineSpeed
+//   byte 16-17:uint16 battery_cV         (batteryVin * 100)
+//   byte 18-19:int16  roll_ddeg          (ypr[2] * 10)
+//   byte 20-21:int16  pitch_ddeg         (ypr[1] * 10)
+//   byte 22-23:int16  yaw_ddeg           (ypr[0] * 10)
+//   byte 24-25:int16  filtered_alt_cm    (filtered_altitude * 100)
+//   byte 26:   checksum (XOR of bytes 2..25)
+// 27 bytes total vs. ~70-90 for the equivalent ASCII CSV line.
+void sendTelemetry() {
+  uint8_t buf[27];
+  uint8_t i = 0;
+  buf[i++] = 0xAA;
+  buf[i++] = 0x55;
+
+  uint32_t t = millis();
+  memcpy(&buf[i], &t, 4); i += 4;
+
+  buf[i++] = (uint8_t)master_state;
+  buf[i++] = (uint8_t)alt_hold_mode;
+
+  int16_t alt_cm = (int16_t)(alt_estimate * 100.0f);
+  memcpy(&buf[i], &alt_cm, 2); i += 2;
+
+  int16_t vspeed_cms = (int16_t)(current_vertical_speed * 100.0f);
+  memcpy(&buf[i], &vspeed_cms, 2); i += 2;
+
+  int16_t setpoint_cm = (int16_t)(altitude_setpoint * 100.0f);
+  memcpy(&buf[i], &setpoint_cm, 2); i += 2;
+
+  uint16_t eng = (uint16_t)engineSpeed;
+  memcpy(&buf[i], &eng, 2); i += 2;
+
+  uint16_t batt_cv = (uint16_t)(batteryVin * 100.0f);
+  memcpy(&buf[i], &batt_cv, 2); i += 2;
+
+  int16_t roll_dd = (int16_t)(ypr[2] * 10.0f);
+  memcpy(&buf[i], &roll_dd, 2); i += 2;
+
+  int16_t pitch_dd = (int16_t)(ypr[1] * 10.0f);
+  memcpy(&buf[i], &pitch_dd, 2); i += 2;
+
+  int16_t yaw_dd = (int16_t)(ypr[0] * 10.0f);
+  memcpy(&buf[i], &yaw_dd, 2); i += 2;
+  
+  // New filtered altitude entry
+  int16_t filtered_alt_cm = (int16_t)(filtered_altitude * 100.0f);
+  memcpy(&buf[i], &filtered_alt_cm, 2); i += 2;
+
+  uint8_t checksum = 0;
+  for (uint8_t j = 2; j < i; j++) {
+    checksum ^= buf[j];
+  }
+  buf[i++] = checksum;
+  Serial1.write(buf, i); 
+}
+
+void testEngines(){
+  delay(15000);
+  // Test rear engines
+  Serial.println("testing rear engines");
+  //Rear engines
+  esc1->setPWM(pinESC1,250.0f,1100/40.0f);
+  esc2->setPWM(pinESC2,250.0f,1100/40.0f);
+  //Front engines
+  esc3->setPWM(pinESC3,250.0f,1000/40.0f);
+  esc4->setPWM(pinESC4,250.0f,1000/40.0f);
+  delay(15000);
+
+  // Test front engines
+  Serial.println("testing front engines");
+  //Rear engines
+  esc1->setPWM(pinESC1,250.0f,1000/40.0f);
+  esc2->setPWM(pinESC2,250.0f,1000/40.0f);
+  //Front engines
+  esc3->setPWM(pinESC3,250.0f,1100/40.0f);
+  esc4->setPWM(pinESC4,250.0f,1100/40.0f);
+  delay(15000);
+
+
+  // Test left engines
+  Serial.println("testing left engines");
+  esc1->setPWM(pinESC1,250.0f,1100/40.0f);
+  esc2->setPWM(pinESC2,250.0f,1000/40.0f);
+  //Front engines
+  esc3->setPWM(pinESC3,250.0f,1100/40.0f);
+  esc4->setPWM(pinESC4,250.0f,1000/40.0f);
+  delay(15000);
+
+  // Test right engines
+  Serial.println("testing right engines");
+  esc1->setPWM(pinESC1,250.0f,1000/40.0f);
+  esc2->setPWM(pinESC2,250.0f,1100/40.0f);
+  //Front engines
+  esc3->setPWM(pinESC3,250.0f,1000/40.0f);
+  esc4->setPWM(pinESC4,250.0f,1100/40.0f);
+  delay(15000);
+
+  // Disable all engines
+  //Rear engines
+  esc1->setPWM(pinESC1,250.0f,1000/40.0f);
+  esc2->setPWM(pinESC2,250.0f,1000/40.0f);
+  //Front engines
+  esc3->setPWM(pinESC3,250.0f,1000/40.0f);
+  esc4->setPWM(pinESC4,250.0f,1000/40.0f);
+  delay(15000);
+
+
+}
+
+
