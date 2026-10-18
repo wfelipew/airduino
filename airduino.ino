@@ -21,18 +21,38 @@ Wire.begin(); -> // Wire.begin();
 
 #define MPU6050_BOARD 0
 #define LSM6DS3_BOARD 1
+#define ISM330DHCX_BOARD 3
 
-#define IMU_BOARD LSM6DS3_BOARD
+#define BARO_BMP388 0
+#define BARO_BMP390 1
+#define BARO_BMP581 3
+
+#define BARO_BOARD BARO_BMP581
+// #define BARO_BOARD BARO_BMP388
+
+// #define BARO_DISABLED 1
+
+#define IMU_BOARD ISM330DHCX_BOARD
 // #define IMU_BOARD MPU6050_BOARD
 
 
-// #include <Servo.h>
-#include <SAMD_PWM.h>
+#if defined(ARDUINO_NANO_ESP32) || defined(ARDUINO_ARCH_ESP32)
+  #include <ESP32_FastPWM.h>
+#elif defined(ARDUINO_SAMD_NANO_33_IOT) || defined(ARDUINO_ARCH_SAMD)
+  #include <SAMD_PWM.h>
+#else
+  #error "Unsupported board architecture selected!"
+#endif
+#if defined(ARDUINO_NANO_ESP32) || defined(ARDUINO_ARCH_ESP32)
+  #define SERVOINPUT_DISABLE_PIN_CHECK
+#endif
+
 #include <ServoInput.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
 #include <MadgwickAHRS.h>
+
 #if IMU_BOARD == MPU6050_BOARD
   #include "I2Cdev.h"
   #include "MPU6050.h"
@@ -40,8 +60,26 @@ Wire.begin(); -> // Wire.begin();
 #elif IMU_BOARD == LSM6DS3_BOARD
   #include "SparkFunLSM6DS3.h"
   LSM6DS3 myIMU(I2C_MODE, 0x6A);
+#elif IMU_BOARD == ISM330DHCX_BOARD
+  // #include <Adafruit_ISM330DHCX.h>
+  // Adafruit_ISM330DHCX ism330dhcx;
+  #include "SparkFun_ISM330DHCX.h"
+  SparkFun_ISM330DHCX myISM;
 #endif
-#include <DFRobot_BMP3XX.h>
+
+#define RAD_TO_DEG_MULT 57.295779513f 
+
+#define SEALEVELPRESSURE_HPA (1013.25)
+
+#if BARO_BOARD == BARO_BMP388
+  #include <DFRobot_BMP3XX.h>
+  DFRobot_BMP388_I2C bmp(&Wire, bmp.eSDOVDD);
+#elif BARO_BOARD == BARO_BMP581
+  #include <Adafruit_Sensor.h>
+  #include "Adafruit_BMP5xx.h"
+  Adafruit_BMP5xx bmp; // Create BMP5xx object
+  bmp5xx_powermode_t desiredMode = BMP5XX_POWERMODE_NORMAL; // Cache desired power mode
+#endif
 
 bool readBarometer(bool force = false);
 /*
@@ -142,14 +180,30 @@ Evaluate list:
 // #define SEALEVELPRESSURE_PA 101325.0f
 
 // DFRobot_BMP388_I2C bmp(&Wire, bmp.eSDOGND);
-DFRobot_BMP388_I2C bmp(&Wire, bmp.eSDOVDD);
+
 
 Madgwick filter;
 
-SAMD_PWM* esc1;
-SAMD_PWM* esc2;
-SAMD_PWM* esc3;
-SAMD_PWM* esc4;
+#if defined(ARDUINO_NANO_ESP32) || defined(ARDUINO_ARCH_ESP32)
+  ESP32_FAST_PWM* esc1;
+  ESP32_FAST_PWM* esc2;
+  ESP32_FAST_PWM* esc3;
+  ESP32_FAST_PWM* esc4;
+  float frequency = 250.0f;
+  int resolution = 12; // 12-bit (0-4095 steps)
+
+  float usToDuty(uint32_t microSeconds) {
+    // Example: If your SAMD code used raw percentage (0.0 to 100.0)
+    // 1000us at 250Hz is 25.0%, 2000us is 50.0%
+    return (microSeconds / 4000.0f) * 100.0f;
+  }
+
+#elif defined(ARDUINO_SAMD_NANO_33_IOT) || defined(ARDUINO_ARCH_SAMD)
+  SAMD_PWM* esc1;
+  SAMD_PWM* esc2;
+  SAMD_PWM* esc3;
+  SAMD_PWM* esc4;
+#endif
 
 const int SDA_PIN = A4; 
 const int SCL_PIN = A5;
@@ -285,17 +339,32 @@ File fdr_file;
 
 void setup() {
 
-  // The first thing to do is attach to the esc's
-  esc1 = new SAMD_PWM(pinESC1, 250.0f, 25.0f);
-  esc2 = new SAMD_PWM(pinESC2, 250.0f, 25.0f);
-  esc3 = new SAMD_PWM(pinESC3, 250.0f, 25.0f);
-  esc4 = new SAMD_PWM(pinESC4, 250.0f, 25.0f);
+  #if defined(ARDUINO_NANO_ESP32) || defined(ARDUINO_ARCH_ESP32)
+    
+    esc1 = new ESP32_FAST_PWM(pinESC1, frequency, 0.0f, 0, resolution);
+    if (esc1) esc1->setPWM_DCPercentage_manual(pinESC1, usToDuty(1000));
+    
+    esc2 = new ESP32_FAST_PWM(pinESC2, frequency, 0.0f, 1, resolution);
+    if (esc2) esc2->setPWM_DCPercentage_manual(pinESC2, usToDuty(1000));
 
-  // And then set it the esc to 1000 to arm the engines
-  esc1->setPWM(pinESC1,250.0f,1000/40.0f);
-  esc2->setPWM(pinESC2,250.0f,1000/40.0f);
-  esc3->setPWM(pinESC3,250.0f,1000/40.0f);
-  esc4->setPWM(pinESC4,250.0f,1000/40.0f);
+    esc3 = new ESP32_FAST_PWM(pinESC3, frequency, 0.0f, 2, resolution);
+    if (esc3) esc3->setPWM_DCPercentage_manual(pinESC3, usToDuty(1000));
+
+    esc4 = new ESP32_FAST_PWM(pinESC4, frequency, 0.0f, 3, resolution);
+    if (esc4) esc4->setPWM_DCPercentage_manual(pinESC4, usToDuty(1000));
+    
+  #elif defined(ARDUINO_SAMD_NANO_33_IOT) || defined(ARDUINO_ARCH_SAMD)
+    esc1 = new SAMD_PWM(pinESC1, 250.0f, 25.0f);
+    esc2 = new SAMD_PWM(pinESC2, 250.0f, 25.0f);
+    esc3 = new SAMD_PWM(pinESC3, 250.0f, 25.0f);
+    esc4 = new SAMD_PWM(pinESC4, 250.0f, 25.0f);
+
+    // And then set it the esc to 1000 to arm the engines
+    esc1->setPWM(pinESC1,250.0f,1000/40.0f);
+    esc2->setPWM(pinESC2,250.0f,1000/40.0f);
+    esc3->setPWM(pinESC3,250.0f,1000/40.0f);
+    esc4->setPWM(pinESC4,250.0f,1000/40.0f);
+  #endif
 
   #ifdef TEST_ENGINES
     testEngines();
@@ -313,7 +382,11 @@ void setup() {
   // Start serial communication
   Serial.begin(230400);//115200
   // Start HC-05 serial comm
-  Serial1.begin(57600);
+  #if defined(ARDUINO_NANO_ESP32) || defined(ARDUINO_ARCH_ESP32)
+    Serial1.begin(57600, SERIAL_8N1, D0, D1);
+  #else
+    Serial1.begin(57600);
+  #endif
   // Serial1.begin(9600);
   // delay(8000);
   Serial.println("Starting setup");
@@ -413,15 +486,19 @@ void loop() {
   gy_raw-=gyro_offset[1];
   gz_raw-=gyro_offset[2]; 
 
-  gx_dps = gx_raw / GYRO_DIVISOR; // trustworthy, real deg/s
+
+  // Convert raw data to degrees per second
+  gx_dps = gx_raw / GYRO_DIVISOR; 
   gy_dps = gy_raw / GYRO_DIVISOR;
   gz_dps = gz_raw / GYRO_DIVISOR;
-  
-  #if IMU_BOARD == LSM6DS3_BOARD
+
+
+  #if IMU_BOARD == LSM6DS3_BOARD || IMU_BOARD == ISM330DHCX_BOARD
   ax_raw -= accel_offset[0];
   ay_raw -= accel_offset[1];
   az_raw -= accel_offset[2];
   #endif
+
 
   ax_gf = ax_raw / 4096.0; // Convert to g-force
   ay_gf = ay_raw / 4096.0;
@@ -443,6 +520,12 @@ void loop() {
     ypr[0] = filter.getYaw() * -1;
     ypr[1] = filter.getPitch();
     ypr[2] = filter.getRoll() * -1;
+    gx_dps *=-1;
+  #elif IMU_BOARD == ISM330DHCX_BOARD
+    filter.updateIMU(gx_dps,gy_dps,gz_dps,ax_gf,ay_gf,az_gf);
+    ypr[0] = filter.getYaw() * -1;
+    ypr[1] = filter.getPitch();
+    ypr[2] = filter.getRoll()* -1;
     gx_dps *=-1;
   #endif
 
@@ -493,7 +576,14 @@ void loop() {
       altitude_setpoint = alt_estimate;
     }
 
+    /*TODO wait for 3 valid readings before enter on althold mode*/
+    // if(!previous_alt_hold_mode && baro_pre_readings>=3){
+    //   previous_alt_hold_mode=alt_hold_mode;
+    // }else(previous_alt_hold_mode){
+    //   previous_alt_hold_mode=alt_hold_mode;
+    // }
     previous_alt_hold_mode=alt_hold_mode;
+
     if(alt_hold_mode){
       if(baroDataReadDone){
         baroDataReadDone=false;
@@ -672,35 +762,35 @@ void loop() {
     // if(micros() - log_timer > 100000 ){
       if(true ){
       char buffer[300];
-      sprintf(buffer,"%d,%f,%f,%f,%f,%f,%f,%d,%f,%f,%f,%f,%d,%f,%f,%f,%d,%f,%f", flightLog.master_state,
-                                                flightLog.gyro_pitch,
-                                                flightLog.gyro_roll,
-                                                flightLog.gyro_yaw,
-                                                flightLog.angle_pitch,
-                                                flightLog.angle_roll,
-                                                flightLog.angle_yaw,
-                                                flightLog.rc_engine_speed,
-                                                flightLog.rc_pitch,
-                                                flightLog.rc_roll,
-                                                flightLog.rc_yaw,
-                                                flightLog.batteryVin,
-                                                flightLog.rcLost,
-                                                flightLog.altitude,
-                                                flightLog.vertical_speed,
-                                                flightLog.ground_altitude,
-                                                flightLog.toogleSwitch,
-                                                flightLog.rc_vspeed_raw,
-                                                flightLog.a_net);
-      // sprintf(buffer,"%f,%f,%f,%f,%f,%f,%d,%f,%f", 
-      //                                           flightLog.altitude,
-      //                                           flightLog.alt_estimate,
-      //                                           flightLog.vertical_speed,
-      //                                           flightLog.raw_pressure,
-      //                                           flightLog.a_net,
-      //                                           flightLog.altitude_setpoint,
+      // sprintf(buffer,"%d,%f,%f,%f,%f,%f,%f,%d,%f,%f,%f,%f,%d,%f,%f,%f,%d,%f,%f", flightLog.master_state,
+      //                                           flightLog.gyro_pitch,
+      //                                           flightLog.gyro_roll,
+      //                                           flightLog.gyro_yaw,
+      //                                           flightLog.angle_pitch,
+      //                                           flightLog.angle_roll,
+      //                                           flightLog.angle_yaw,
       //                                           flightLog.rc_engine_speed,
+      //                                           flightLog.rc_pitch,
+      //                                           flightLog.rc_roll,
+      //                                           flightLog.rc_yaw,
+      //                                           flightLog.batteryVin,
+      //                                           flightLog.rcLost,
+      //                                           flightLog.altitude,
+      //                                           flightLog.vertical_speed,
+      //                                           flightLog.ground_altitude,
+      //                                           flightLog.toogleSwitch,
       //                                           flightLog.rc_vspeed_raw,
-      //                                           flightLog.rc_vspeed_filtered);
+      //                                           flightLog.a_net);
+      sprintf(buffer,"%f,%f,%f,%f,%f,%f,%d,%f,%f", 
+                                                flightLog.altitude,
+                                                flightLog.alt_estimate,
+                                                flightLog.vertical_speed,
+                                                flightLog.raw_pressure,
+                                                flightLog.a_net,
+                                                flightLog.altitude_setpoint,
+                                                flightLog.rc_engine_speed,
+                                                flightLog.rc_vspeed_raw,
+                                                flightLog.rc_vspeed_filtered);
       Serial.println(buffer);
       log_timer = micros();
     }
@@ -728,10 +818,17 @@ void loop() {
 }
 
 void disableEngines(){
-  esc1->setPWM(pinESC1,250.0f,1000/40.0f);
-  esc2->setPWM(pinESC2,250.0f,1000/40.0f);
-  esc3->setPWM(pinESC3,250.0f,1000/40.0f);
-  esc4->setPWM(pinESC4,250.0f,1000/40.0f);
+  #if defined(ARDUINO_NANO_ESP32)
+    esc1->setPWM_DCPercentage_manual(pinESC1, usToDuty(1000));
+    esc2->setPWM_DCPercentage_manual(pinESC2, usToDuty(1000));
+    esc3->setPWM_DCPercentage_manual(pinESC3, usToDuty(1000));
+    esc4->setPWM_DCPercentage_manual(pinESC4, usToDuty(1000));
+  #elif defined(ARDUINO_SAMD_NANO_33_IOT)
+    esc1->setPWM(pinESC1,250.0f,1000/40.0f);
+    esc2->setPWM(pinESC2,250.0f,1000/40.0f);
+    esc3->setPWM(pinESC3,250.0f,1000/40.0f);
+    esc4->setPWM(pinESC4,250.0f,1000/40.0f);
+  #endif
 }
 
 void enableEngines(){
@@ -905,13 +1002,23 @@ void setAllEnginesSpeed(int speed){
     yaw_error_previous = 0;
   }
 
+  #if defined(ARDUINO_NANO_ESP32)
   //Rear engines
-  esc1->setPWM(pinESC1,250.0f,leftRear/40.0f);
-  esc2->setPWM(pinESC2,250.0f,rightRear/40.0f);
+    esc1->setPWM_DCPercentage_manual(pinESC1, usToDuty(leftRear));
+    esc2->setPWM_DCPercentage_manual(pinESC2, usToDuty(rightRear));
 
-  //Front engines
-  esc3->setPWM(pinESC3,250.0f,leftFront/40.0f);
-  esc4->setPWM(pinESC4,250.0f,rightFront/40.0f);
+    //Front engines
+    esc3->setPWM_DCPercentage_manual(pinESC3, usToDuty(leftFront));
+    esc4->setPWM_DCPercentage_manual(pinESC4, usToDuty(rightFront));
+  #elif defined(ARDUINO_SAMD_NANO_33_IOT)
+    //Rear engines
+    esc1->setPWM(pinESC1,250.0f,leftRear/40.0f);
+    esc2->setPWM(pinESC2,250.0f,rightRear/40.0f);
+
+    //Front engines
+    esc3->setPWM(pinESC3,250.0f,leftFront/40.0f);
+    esc4->setPWM(pinESC4,250.0f,rightFront/40.0f);
+  #endif
 
   #ifdef PRINT_PARAMETERS
     
@@ -967,43 +1074,80 @@ void resetWire(){
 }
 
 void setupBarometerBoard(){
-  //temp disable
-  // return;
-  if (bmp.begin()!=ERR_OK) {
-    Serial.println("Could not find a valid BMP3 sensor, check wiring!");
-    while(1);
-  } else {
-    Serial.println("BMP3XX Barometer initialized successfully!");
-    bool ok = bmp.setSamplingMode(bmp.eNormalPrecision2);
-
-    if(ok){
-      Serial.println("BMP Samp Config OK");
-    }else{
-      Serial.println("BMP Samp Config Failed");
+  // delay(5000);
+  
+  #ifdef BARO_DISABLED
+    return;
+  #endif
+  #if BARO_BOARD == BARO_BMP388
+    if (bmp.begin()!=ERR_OK) {
+      Serial.println("Could not find a valid BMP3 sensor, check wiring!");
       while(1);
-    }
-    Serial.println("BMP Samp period");
-    Serial.println(bmp.getSamplingPeriodUS());
+    } else {
+      Serial.println("BMP3XX Barometer initialized successfully!");
+      bool ok = bmp.setSamplingMode(bmp.eNormalPrecision2);
 
-    bmp.setINTMode(
-        bmp.eINTPinPP |
-        bmp.eINTPinActiveLevelHigh |
-        // bmp.eINTLatchEN |
-        bmp.eINTLatchDIS |
-        bmp.eIntFWtmDis |
-        bmp.eINTFFullDIS |
-        bmp.eINTInitialLevelLOW |
-        bmp.eINTDataDrdyEN
-    );
-    // bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
-    // bmp.setPressureOversampling(BMP3_OVERSAMPLING_8X);
-    // bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
-    // bmp.setOutputDataRate(BMP3_ODR_50_HZ);
-  }
+      if(ok){
+        Serial.println("BMP Samp Config OK");
+      }else{
+        Serial.println("BMP Samp Config Failed");
+        while(1);
+      }
+      Serial.println("BMP Samp period");
+      Serial.println(bmp.getSamplingPeriodUS());
+
+      bmp.setINTMode(
+          bmp.eINTPinPP |
+          bmp.eINTPinActiveLevelHigh |
+          // bmp.eINTLatchEN |
+          bmp.eINTLatchDIS |
+          bmp.eIntFWtmDis |
+          bmp.eINTFFullDIS |
+          bmp.eINTInitialLevelLOW |
+          bmp.eINTDataDrdyEN
+      );
+      // bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
+      // bmp.setPressureOversampling(BMP3_OVERSAMPLING_8X);
+      // bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+      // bmp.setOutputDataRate(BMP3_ODR_50_HZ);
+    }
+  #elif BARO_BOARD == BARO_BMP581
+    if (!bmp.begin(BMP5XX_ALTERNATIVE_ADDRESS, &Wire)) {
+    //if (!bmp.begin(BMP5XX_DEFAULT_ADDRESS, &Wire)) {
+      Serial.println(F("Could not find a valid BMP5xx sensor, check wiring!"));
+      while (1); 
+    }
+    Serial.println(F("BMP5xx found!"));
+    Serial.println();
+
+    Serial.println(F("Setting temperature oversampling to 2X..."));
+    bmp.setTemperatureOversampling(BMP5XX_OVERSAMPLING_2X);
+
+    Serial.println(F("Setting pressure oversampling to 8X..."));
+    bmp.setPressureOversampling(BMP5XX_OVERSAMPLING_8X);
+
+    Serial.println(F("Setting IIR filter to coefficient 3..."));
+    bmp.setIIRFilterCoeff(BMP5XX_IIR_FILTER_COEFF_3);
+
+    Serial.println(F("Setting output data rate to 50 Hz..."));
+    bmp.setOutputDataRate(BMP5XX_ODR_50_HZ);
+
+    Serial.println(F("Setting power mode to normal..."));
+    desiredMode = BMP5XX_POWERMODE_NORMAL;
+    bmp.setPowerMode(desiredMode);
+
+    Serial.println(F("Enabling pressure measurement..."));
+    bmp.enablePressure(true);
+
+    bmp.configureInterrupt(BMP5XX_INTERRUPT_PULSED, BMP5XX_INTERRUPT_ACTIVE_HIGH, BMP5XX_INTERRUPT_PUSH_PULL, BMP5XX_INTERRUPT_DATA_READY, true);
+
+
+  #endif
 }
 
 void setupBoard()
 {
+  // delay(5000);
   Serial.println("Setup IMU board.");
   #if IMU_BOARD == MPU6050_BOARD
     mpu.setClockSource(MPU6050_CLOCK_PLL_XGYRO);
@@ -1059,6 +1203,59 @@ void setupBoard()
       Serial.println(test);
       while (1); 
     }
+  #elif IMU_BOARD == ISM330DHCX_BOARD
+    if (!myISM.begin(0x6B)) { //
+      Serial.println("IMU failed to initialize.");
+      while (1);
+    }
+
+    // 1. Match your 416Hz ODR and 50Hz Cutoff Filter natively
+    myISM.deviceReset();
+    delay(100);
+    
+    myISM.setDeviceConfig();
+	  myISM.setBlockDataUpdate();
+
+    myISM.setGyroDataRate(ISM_GY_ODR_416Hz);
+    myISM.setAccelDataRate(ISM_XL_ODR_416Hz);
+
+
+    // Set ranges to scale 
+    myISM.setGyroFullScale(ISM_2000dps);
+    myISM.setAccelFullScale(ISM_8g);
+
+    // 1. Enable the Gyroscope's low-pass filter (LP1) circuit path
+    myISM.setGyroFilterLP1();
+
+    // 2. Select the specific filter bandwidth setting
+    // At a 416Hz ODR: ISM_STRONG configures a ~50.7Hz hardware cutoff point
+    myISM.setGyroLP1Bandwidth(ISM_STRONG);
+
+    // 3. Optional: Enable the Accelerometer's digital low-pass filter (LP2)
+    myISM.setAccelFilterLP2();
+
+    // 4. Set the Accelerometer bandwidth to ODR / 100 (~4.16Hz) to clean motor vibrations
+    myISM.setAccelSlopeFilter(ISM_LP_ODR_DIV_100); 
+
+    accel_offset[0] = 82; //55;
+    accel_offset[1] = -275; //74; 
+    accel_offset[2] = 18; //34;
+
+    // if (!ism330dhcx.begin_I2C(0x6B)) {
+    //   Serial.println("Failed to find ISM330DHCX chip");
+    //   while (1) {
+    //     delay(10);
+    //   }
+    // }
+    // Serial.println("ISM330DHCX Found!");
+
+    // ism330dhcx.setAccelRange(LSM6DS_ACCEL_RANGE_2_G);
+    // ism330dhcx.setGyroRange(LSM6DS_GYRO_RANGE_2000_DPS);
+
+    // ism330dhcx.setGyroDataRate(LSM6DS_RATE_416_HZ);
+    // ism330dhcx.setAccelDataRate(LSM6DS_RATE_416_HZ);
+
+    //check filtering
 
   #endif
 
@@ -1077,6 +1274,14 @@ void getRotation(int16_t* x, int16_t* y, int16_t* z){
     *x = ((int16_t)buffer[0] | int16_t(buffer[1] << 8));
     *y = (int16_t)buffer[2] | int16_t(buffer[3] << 8);
     *z = (int16_t)buffer[4] | int16_t(buffer[5] << 8);
+  #elif IMU_BOARD == ISM330DHCX_BOARD
+    sfe_ism_raw_data_t gyroRaw;
+    if (myISM.checkStatus()) {
+      myISM.getRawGyro(&gyroRaw);
+      *x = gyroRaw.xData;
+      *y = gyroRaw.yData;
+      *z = gyroRaw.zData;
+    }
   #endif
 
 }
@@ -1099,6 +1304,55 @@ void getMotion(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int16_t* gy, 
     *ax = ((int16_t)buffer[6] | int16_t(buffer[7] << 8));
     *ay = ((int16_t)buffer[8] | int16_t(buffer[9] << 8));
     *az = ((int16_t)buffer[10] | int16_t(buffer[11] << 8));
+  #elif IMU_BOARD == ISM330DHCX_BOARD
+    // uint8_t buffer[12];
+    // // Start at register 0x22 (OUTX_L_G) and read 12 sequential bytes
+    // myISM.readRegisterRegion(0x22, buffer, 12);
+    
+    // // Combine the Low and High bytes using bitwise math (Little Endian format)
+    // // Gyro data comes first in the memory map
+    // // if (myISM.checkStatus()) {
+    //   *gx = ((int16_t)buffer[0] | int16_t(buffer[1] << 8)); 
+    //   *gy = ((int16_t)buffer[2] | int16_t(buffer[3] << 8));
+    //   *gz = ((int16_t)buffer[4] | int16_t(buffer[5] << 8)); 
+      
+    //   // Accelerometer data immediately follows
+    //   *ax = ((int16_t)buffer[6] | int16_t(buffer[7] << 8));
+    //   *ay = ((int16_t)buffer[8] | int16_t(buffer[9] << 8));
+    //   *az = ((int16_t)buffer[10] | int16_t(buffer[11] << 8));
+    // // }
+
+    // sensors_event_t accel, gyro, temp;
+    // ism330dhcx.getEvent(&accel, &gyro, &temp);
+
+    // // Gyro data comes first in the memory map
+    // Serial.println(gyro.gyro.x);
+    // Serial.println(gyro.gyro.y);
+    // gx = gyro.gyro.x * RAD_TO_DEG_MULT; 
+    // gy = gyro.gyro.y * RAD_TO_DEG_MULT;
+    // gz = gyro.gyro.z * RAD_TO_DEG_MULT; 
+    
+    
+    // // Accelerometer data immediately follows
+    // *ax = accel.acceleration.x / SENSORS_GRAVITY_STANDARD;
+    // *ay = accel.acceleration.y / SENSORS_GRAVITY_STANDARD;
+    // *az = accel.acceleration.z / SENSORS_GRAVITY_STANDARD;
+  sfe_ism_raw_data_t accelRaw; 
+  sfe_ism_raw_data_t gyroRaw;  
+  if (myISM.checkStatus()) {  
+    
+    myISM.getRawGyro(&gyroRaw);
+    myISM.getRawAccel(&accelRaw); 
+
+    *ax = accelRaw.xData;
+    *ay = accelRaw.yData;
+    *az = accelRaw.zData;
+
+    *gx = gyroRaw.xData;
+    *gy = gyroRaw.yData;
+    *gz = gyroRaw.zData;
+
+  }
   #endif
 }
 
@@ -1149,17 +1403,36 @@ bool isRCSignalLost(){
 }
 
 bool readBarometer(bool force){
-  //temp disable
-  // return false;
+  float current_raw_altitude = 0;  
   if(baroDataReady || force){
-    //  Serial.println("Barometer Ready");
+    
     baroDataReady = false;
     unsigned long current_time = baro_isr_micros;
+    
+    #if BARO_BOARD == BARO_BMP388
+      current_raw_altitude =  bmp.readAltitudeM();
+      #ifdef PRINT_PARAMETERS
+        raw_pressure = bmp.readPressPa() / 100;
+        flightLog.raw_pressure= raw_pressure;
+      #endif
+    #elif BARO_BOARD == BARO_BMP581
+      if (!bmp.dataReady()) {
+        return false;
+      }
+      // Data is ready, perform reading
+      if (!bmp.performReading()) {
+        return false;
+      }
+      current_raw_altitude = bmp.readAltitude(SEALEVELPRESSURE_HPA);
+      #ifdef PRINT_PARAMETERS
+        flightLog.raw_pressure= bmp.readPressure();
+      #endif
+    #endif
+    
     if (last_baro_read == 0) {
       last_baro_read = current_time;
-      filtered_altitude = bmp.readAltitudeM();
-      previous_altitude = filtered_altitude;
-      alt_estimate = filtered_altitude;
+      previous_altitude = current_raw_altitude;
+      alt_estimate = current_raw_altitude;
       vvel_estimate = 0;
       return false;
     }
@@ -1167,11 +1440,8 @@ bool readBarometer(bool force){
     last_baro_read = current_time;
     if (dt_baro <= 0.001f) return false;
     
-    current_altitude = bmp.readAltitudeM(); // This to heavy for Arduino NANO IOT
-    #ifdef PRINT_PARAMETERS
-      raw_pressure = bmp.readPressPa() / 100;
-      flightLog.raw_pressure= raw_pressure;
-    #endif
+    current_altitude = current_raw_altitude; // This to heavy for Arduino NANO IOT
+
     // float raw_pressure = 0;
     // current_altitude = (SEALEVELPRESSURE_PA - raw_pressure) / 8.3f;
     // current_altitude = 0;
@@ -1197,7 +1467,7 @@ bool readBarometer(bool force){
     float a_net = (filtered_a_up_g - 1.0f) * 9.81f;  // strip gravity -> net vertical accel, m/s^2
     #ifdef PRINT_PARAMETERS
       flightLog.a_net = a_net;
-      flightLog.raw_pressure= raw_pressure;
+      // flightLog.raw_pressure= raw_pressure;
     #endif
 
     vvel_estimate += a_net * dt_baro;
@@ -1216,8 +1486,9 @@ bool readBarometer(bool force){
     // current_vertical_speed = baro_velocity;
     baroDataReadDone=true;
     return true;
+    
   }
-  return false;
+    return false;
 }
 
 void baroISR()
@@ -1312,55 +1583,57 @@ void sendTelemetry() {
 }
 
 void testEngines(){
-  delay(15000);
-  // Test rear engines
-  Serial.println("testing rear engines");
-  //Rear engines
-  esc1->setPWM(pinESC1,250.0f,1100/40.0f);
-  esc2->setPWM(pinESC2,250.0f,1100/40.0f);
-  //Front engines
-  esc3->setPWM(pinESC3,250.0f,1000/40.0f);
-  esc4->setPWM(pinESC4,250.0f,1000/40.0f);
-  delay(15000);
+  #if defined(ARDUINO_NANO_ESP32)
+  #elif defined(ARDUINO_SAMD_NANO_33_IOT)
+    delay(15000);
+    // Test rear engines
+    Serial.println("testing rear engines");
+    //Rear engines
+    esc1->setPWM(pinESC1,250.0f,1100/40.0f);
+    esc2->setPWM(pinESC2,250.0f,1100/40.0f);
+    //Front engines
+    esc3->setPWM(pinESC3,250.0f,1000/40.0f);
+    esc4->setPWM(pinESC4,250.0f,1000/40.0f);
+    delay(15000);
 
-  // Test front engines
-  Serial.println("testing front engines");
-  //Rear engines
-  esc1->setPWM(pinESC1,250.0f,1000/40.0f);
-  esc2->setPWM(pinESC2,250.0f,1000/40.0f);
-  //Front engines
-  esc3->setPWM(pinESC3,250.0f,1100/40.0f);
-  esc4->setPWM(pinESC4,250.0f,1100/40.0f);
-  delay(15000);
+    // Test front engines
+    Serial.println("testing front engines");
+    //Rear engines
+    esc1->setPWM(pinESC1,250.0f,1000/40.0f);
+    esc2->setPWM(pinESC2,250.0f,1000/40.0f);
+    //Front engines
+    esc3->setPWM(pinESC3,250.0f,1100/40.0f);
+    esc4->setPWM(pinESC4,250.0f,1100/40.0f);
+    delay(15000);
 
 
-  // Test left engines
-  Serial.println("testing left engines");
-  esc1->setPWM(pinESC1,250.0f,1100/40.0f);
-  esc2->setPWM(pinESC2,250.0f,1000/40.0f);
-  //Front engines
-  esc3->setPWM(pinESC3,250.0f,1100/40.0f);
-  esc4->setPWM(pinESC4,250.0f,1000/40.0f);
-  delay(15000);
+    // Test left engines
+    Serial.println("testing left engines");
+    esc1->setPWM(pinESC1,250.0f,1100/40.0f);
+    esc2->setPWM(pinESC2,250.0f,1000/40.0f);
+    //Front engines
+    esc3->setPWM(pinESC3,250.0f,1100/40.0f);
+    esc4->setPWM(pinESC4,250.0f,1000/40.0f);
+    delay(15000);
 
-  // Test right engines
-  Serial.println("testing right engines");
-  esc1->setPWM(pinESC1,250.0f,1000/40.0f);
-  esc2->setPWM(pinESC2,250.0f,1100/40.0f);
-  //Front engines
-  esc3->setPWM(pinESC3,250.0f,1000/40.0f);
-  esc4->setPWM(pinESC4,250.0f,1100/40.0f);
-  delay(15000);
+    // Test right engines
+    Serial.println("testing right engines");
+    esc1->setPWM(pinESC1,250.0f,1000/40.0f);
+    esc2->setPWM(pinESC2,250.0f,1100/40.0f);
+    //Front engines
+    esc3->setPWM(pinESC3,250.0f,1000/40.0f);
+    esc4->setPWM(pinESC4,250.0f,1100/40.0f);
+    delay(15000);
 
-  // Disable all engines
-  //Rear engines
-  esc1->setPWM(pinESC1,250.0f,1000/40.0f);
-  esc2->setPWM(pinESC2,250.0f,1000/40.0f);
-  //Front engines
-  esc3->setPWM(pinESC3,250.0f,1000/40.0f);
-  esc4->setPWM(pinESC4,250.0f,1000/40.0f);
-  delay(15000);
-
+    // Disable all engines
+    //Rear engines
+    esc1->setPWM(pinESC1,250.0f,1000/40.0f);
+    esc2->setPWM(pinESC2,250.0f,1000/40.0f);
+    //Front engines
+    esc3->setPWM(pinESC3,250.0f,1000/40.0f);
+    esc4->setPWM(pinESC4,250.0f,1000/40.0f);
+    delay(15000);
+  #endif
 
 }
 
