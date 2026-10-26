@@ -81,6 +81,12 @@ Wire.begin(); -> // Wire.begin();
   bmp5xx_powermode_t desiredMode = BMP5XX_POWERMODE_NORMAL; // Cache desired power mode
 #endif
 
+#if defined(ARDUINO_NANO_ESP32)
+void IRAM_ATTR baroISR();
+#else
+void baroISR();
+#endif
+
 bool readBarometer(bool force = false);
 /*
 Todo list:
@@ -90,21 +96,21 @@ Todo list:
 - Add yaw control (DONE)
 - ON/OFF switch from RC (DONE)
 - Check if there is realiable (async) way to write to the flight data to sdcard
-- Check if doable to send telemetry over wifi
-- Add barometer to control altitude
+- Check if doable to send telemetry over wifi (DONE with bluetooth HS-05)
+- Add barometer to control altitude (IN-PROGRESS)
 - Add GPS control
 - Add colision sensors
 - Calculate the lift force
 - Calculate the battery duration estimation
 
 Evaluate list:
-- Replace DMP with madgwick
-- Replace MPU with arduino internal IMU
-- Replace MPU6050 with ICM-20948
+- Replace DMP with madgwick (DONE)
+- Replace MPU with arduino internal IMU LSM6DS3 (DONE)
+- Replace LSM6DS3 with ISM330DHCX_BOARD (DONE)
 */
 
 // #define DEBUG_MODE true
-// #define PRINT_PARAMETERS true
+#define PRINT_PARAMETERS true
 // #define TEST_ENGINES true
 
 
@@ -157,9 +163,11 @@ Evaluate list:
 #define PID_I_GAIN_YAW 0.01 //0.02//0.002//0.02
 #define PID_D_GAIN_YAW 0
 
-#define PID_P_GAIN_ALT 50.0  
-#define PID_I_GAIN_ALT 0.2   
-#define PID_D_GAIN_ALT 0.1
+#define PID_P_GAIN_ALT 2
+
+#define PID_P_GAIN_ALT_VEL 50.0  
+#define PID_I_GAIN_ALT_VEL 10   
+#define PID_D_GAIN_ALT_VEL 0.1
 
 
 #define PID_I_MAX 400 //150
@@ -179,8 +187,6 @@ Evaluate list:
 #define SEALEVELPRESSURE_HPA 1013.25f
 // #define SEALEVELPRESSURE_PA 101325.0f
 
-// DFRobot_BMP388_I2C bmp(&Wire, bmp.eSDOGND);
-
 
 Madgwick filter;
 
@@ -197,7 +203,6 @@ Madgwick filter;
     // 1000us at 250Hz is 25.0%, 2000us is 50.0%
     return (microSeconds / 4000.0f) * 100.0f;
   }
-
 #elif defined(ARDUINO_SAMD_NANO_33_IOT) || defined(ARDUINO_ARCH_SAMD)
   SAMD_PWM* esc1;
   SAMD_PWM* esc2;
@@ -221,21 +226,23 @@ bool gyroCalibrationDone = false;
 bool toogle_on = false;
 bool toogle_altitude_hold = false;
 
-float current_altitude = 0, previous_altitude = 0, filtered_altitude = 0, filtered_a_up_g = 0, raw_pressure =0, home_altitude=0;
+float current_altitude = 0, previous_altitude = 0, filtered_altitude = 0, ground_altitude=0, filtered_a_up_g = 0, raw_pressure =0, home_altitude=0, bias=0;
 float current_vertical_speed = 0, target_vertical_speed = 0;
-float altitude_setpoint = 0, altitude_error=0;
-unsigned long last_baro_read = 0;
+float altitude_setpoint = 0, altitude_error=0, altitude_vel_setpoint=0;
+unsigned long last_baro_read = 0, last_altitude_estimate =0;
 volatile bool baroDataReady;
 bool baroDataReadDone = false;
 
 // Complementary filter state: fuses integrated accel with the noisy barometer
 float vvel_estimate = 0;   // fused vertical velocity, m/s (+ = up), replaces raw baro derivative
 float alt_estimate  = 0;   // fused altitude, m
-#define ALT_FUSION_KP 0.3f  // 0-1, how hard each new baro sample pulls the altitude estimate
-#define ALT_FUSION_KV 0.005f  // how hard each new baro sample pulls the velocity estimate - tune on the bench
+#define ALT_FUSION_KB 0.5//0.05f
+#define ALT_FUSION_KP 0.12//0.3f  // 0-1, how hard each new baro sample pulls the altitude estimate
+#define ALT_FUSION_KV 12//0.005f  // how hard each new baro sample pulls the velocity estimate - tune on the bench
 // #define ALT_FUSION_KV 0.03f 
 float alt_vel_error = 0, alt_vel_error_previous = 0;
 float pid_p_alt = 0, pid_i_alt = 1100, pid_d_alt = 0;
+float refG = 1.0f;
 
 int batteryADCRaw = 0;
 float batteryADC = 0;
@@ -301,7 +308,11 @@ struct log {
   float a_net;
   float alt_estimate;
   float altitude_setpoint;
+  float altitude_vel_setpoint;
   float rc_vspeed_filtered;
+  float altitude_raw;
+  float bias;
+  bool toogle_altitude_hold;
 } flightLog;
 
 // Timers
@@ -445,7 +456,7 @@ void setup() {
   gyro_filtered[1]=0;
   gyro_filtered[2]=0;
 
-
+  calibrateGRefOffset();
   // Setup madgwick filter
   filter.begin(250);
   
@@ -469,87 +480,8 @@ void setup() {
 
 void loop() {
   buf="";
-  
+  processIMUData();
 
-  int16_t gx_raw, gy_raw, gz_raw;
-  int16_t ax_raw, ay_raw, az_raw;
-
-  getMotion(&ax_raw, &ay_raw, &az_raw,&gx_raw, &gy_raw, &gz_raw);
-
-  if (ax_raw == last_ax_raw && ay_raw == last_ay_raw && az_raw == last_az_raw) {
-    frozen_counter++;
-  } else {
-    frozen_counter = 0; // Reset counter if data changes
-  }
-
-  gx_raw-=gyro_offset[0];
-  gy_raw-=gyro_offset[1];
-  gz_raw-=gyro_offset[2]; 
-
-
-  // Convert raw data to degrees per second
-  gx_dps = gx_raw / GYRO_DIVISOR; 
-  gy_dps = gy_raw / GYRO_DIVISOR;
-  gz_dps = gz_raw / GYRO_DIVISOR;
-
-
-  #if IMU_BOARD == LSM6DS3_BOARD || IMU_BOARD == ISM330DHCX_BOARD
-  ax_raw -= accel_offset[0];
-  ay_raw -= accel_offset[1];
-  az_raw -= accel_offset[2];
-  #endif
-
-
-  ax_gf = ax_raw / 4096.0; // Convert to g-force
-  ay_gf = ay_raw / 4096.0;
-  az_gf = az_raw / 4096.0;
-
-
-  #if IMU_BOARD == MPU6050_BOARD
-    if(frozen_counter >=3){ // Check if still needed, and how to detect the issue
-      resetWire();
-    }else{
-      filter.updateIMU(gx_dps,gy_dps,gz_dps,ax_gf,ay_gf,az_gf);
-    }
-    ypr[0] = filter.getYaw();
-    ypr[1] = filter.getPitch();
-    ypr[2] = filter.getRoll();
-    gy_dps *=-1;
-  #elif IMU_BOARD == LSM6DS3_BOARD
-    filter.updateIMU(gx_dps,gy_dps,gz_dps,ax_gf,ay_gf,az_gf);
-    ypr[0] = filter.getYaw() * -1;
-    ypr[1] = filter.getPitch();
-    ypr[2] = filter.getRoll() * -1;
-    gx_dps *=-1;
-  #elif IMU_BOARD == ISM330DHCX_BOARD
-    filter.updateIMU(gx_dps,gy_dps,gz_dps,ax_gf,ay_gf,az_gf);
-    ypr[0] = filter.getYaw() * -1;
-    ypr[1] = filter.getPitch();
-    ypr[2] = filter.getRoll()* -1;
-    gx_dps *=-1;
-  #endif
-
-  if( ! (abs(gx_dps) > 400 || abs(gy_dps) > 400 || abs(gz_dps) > 400)  ){
-    gyro_filtered[0]= ( (0.7 * gyro_filtered[0])  + (0.3 * gx_dps) );
-    gyro_filtered[1]= ( (0.7 * gyro_filtered[1])  + (0.3 * gy_dps) );
-    gyro_filtered[2]= ( (0.7 * gyro_filtered[2])  + (0.3 * gz_dps) );
-
-  }
-  lastGoodPacket = millis();
-
-  last_ax_raw = ax_raw;
-  last_ay_raw = ay_raw;
-  last_az_raw = az_raw;
-
-  #ifdef PRINT_PARAMETERS
-    flightLog.gyro_pitch = gyro_filtered[1];
-    flightLog.gyro_roll = gyro_filtered[2];
-    flightLog.gyro_yaw = gyro_filtered[0];
-
-    flightLog.angle_pitch = ypr[1];
-    flightLog.angle_roll = ypr[2];
-    flightLog.angle_yaw = ypr[0];
-  #endif
 
   if(!isRCSignalLost()){
 
@@ -557,13 +489,14 @@ void loop() {
     flightLog.toogleSwitch = toogleSwitchRaw;
     readToogles();
     alt_hold_mode=toogle_altitude_hold;
+    flightLog.toogle_altitude_hold=toogle_altitude_hold;
     
     if(alt_hold_mode && !previous_alt_hold_mode){
       pid_i_alt = constrain(rf_throttle.getPulse(), 1300, 1700);
-      last_baro_read = baro_isr_micros;
-      vvel_estimate = 0;
-      readBarometer(true);
-      readBarometer(true);
+      // last_baro_read = baro_isr_micros;
+      // vvel_estimate = 0;
+      // readBarometer(true);
+      estimateAltitude();
       rc_vspeed_raw = 0;
       previous_rc_vspeed_raw = 0;
       rc_vspeed_filtered=0;
@@ -576,7 +509,7 @@ void loop() {
       altitude_setpoint = alt_estimate;
     }
 
-    /*TODO wait for 3 valid readings before enter on althold mode*/
+    /*TODO wait for 3 valid readings before enter on althold mode on NANO IOT*/
     // if(!previous_alt_hold_mode && baro_pre_readings>=3){
     //   previous_alt_hold_mode=alt_hold_mode;
     // }else(previous_alt_hold_mode){
@@ -586,52 +519,56 @@ void loop() {
 
     if(alt_hold_mode){
       if(baroDataReadDone){
-        baroDataReadDone=false;
-        flightLog.altitude = filtered_altitude;
-        flightLog.alt_estimate = alt_estimate;
-        flightLog.vertical_speed = current_vertical_speed;
+        // baroDataReadDone=false;
+
         if(alt_hold_mode && master_state == STATE_ON){
           rc_vspeed_raw = ((float)rf_throttle.mapDeadzone(-2000,2000, 0.2))/ 1000.0;
-          if(abs(rc_vspeed_raw - previous_rc_vspeed_raw) > 1){
+          if(abs(rc_vspeed_raw - previous_rc_vspeed_raw) > 1.5){
             rc_vspeed_raw=previous_rc_vspeed_raw;
           }
           rc_vspeed_filtered = (rc_vspeed_filtered*0.8) + (rc_vspeed_raw*0.2);
           flightLog.rc_vspeed_raw = rc_vspeed_raw;
           flightLog.rc_vspeed_filtered = rc_vspeed_filtered;
           
-          if(rc_vspeed_raw == 0 && previous_rc_vspeed_raw !=0 ){
-            altitude_setpoint = alt_estimate;
-          }
-          if(rc_vspeed_raw == 0){
-            // altitude_error = alt_estimate -  altitude_setpoint;
-            // alt_vel_error = current_vertical_speed - (altitude_error * 2);
-            altitude_error = altitude_setpoint - alt_estimate;
-            alt_vel_error = altitude_error;
-            // alt_vel_error  = (altitude_error * 2) - current_vertical_speed;
-            //Add a dead band here
-          }else{      
-            alt_vel_error = rc_vspeed_filtered - current_vertical_speed;
-          }
-          flightLog.altitude_setpoint = altitude_setpoint;
-
-          // if(abs(alt_vel_error) < 0.3){
-          //   alt_vel_error=0;
-          // }
+          //rc_vspeed will control the climb rate
+          float climb = rc_vspeed_filtered;
           
-          pid_p_alt = alt_vel_error * PID_P_GAIN_ALT;
-          pid_i_alt += alt_vel_error * PID_I_GAIN_ALT;
-          pid_i_alt = constrain(pid_i_alt, 1400, 1700);
-          pid_d_alt = (alt_vel_error - alt_vel_error_previous) * PID_D_GAIN_ALT;
+          // If absolut climb rate (RC control) out of 0, increase the altitude setpoint (why 0.02)
+          if (fabs(climb) > 0.01){
+            altitude_setpoint += climb * 0.002;
+          }
+
+          //Dont allow the altitude setpoint to be higher the 1.5m than the current altitue
+          altitude_setpoint = constrain(altitude_setpoint, alt_estimate - 1.5f, alt_estimate + 1.5f);
+          
+          //Altitude error is the diff between the setpoint and current altitude
+          altitude_error = altitude_setpoint - alt_estimate;
+          
+          //Altitude velocity setpoint is the altitude error * P (+climb rate, is it feedforward?)
+          altitude_vel_setpoint = (altitude_error *  PID_P_GAIN_ALT)+climb ;
+          altitude_vel_setpoint = constrain(altitude_vel_setpoint,-3,3);
+          alt_vel_error = altitude_vel_setpoint - current_vertical_speed;
+          
+          //TODO Set hover throotle
+          //TODO Apply tilt compensation
+          float tilt_comp = cos(radians(ypr[1])) * cos(radians(ypr[2]));
+          tilt_comp = constrain(tilt_comp, 0.8f, 1.0f);
+
+
+          flightLog.altitude_setpoint = altitude_setpoint;
+          float dt_loop = 0.004f;
+          pid_p_alt = alt_vel_error * PID_P_GAIN_ALT_VEL;
+          pid_i_alt += alt_vel_error * PID_I_GAIN_ALT_VEL * dt_loop;
+          pid_i_alt = constrain(pid_i_alt, 1100, 1700);
+          pid_d_alt = ((alt_vel_error - alt_vel_error_previous)/dt_loop) * PID_D_GAIN_ALT_VEL;
           alt_vel_error_previous = alt_vel_error;
 
           engineSpeed = pid_i_alt + pid_p_alt + pid_d_alt;
-          engineSpeed = constrain(engineSpeed, 1000, 1700);
+          float thrust = engineSpeed - 1000;
+          float tilt_compensated_engineSpeed = 1000 + thrust / sqrtf(tilt_comp);
+          
+          engineSpeed = constrain(tilt_compensated_engineSpeed, 1000, 1700);
 
-          // if(filtered_altitude - home_altitude > 2){
-          //   engineSpeed-=50;
-          // }
-
-          // altitudeStick = 
           previous_rc_vspeed_raw = rc_vspeed_raw;
         }
       }
@@ -711,6 +648,9 @@ void loop() {
     if(!gyroCalibrationDone)
       calibrateOffset();
 
+    calibrateGroundAltitude();
+    calibrateGRefOffset();
+    last_baro_read = 0;
     readBarometer(true);
     home_altitude = current_altitude;
     pid_i_pitch = 0;
@@ -723,6 +663,11 @@ void loop() {
     pitchAngle_raw = 0; rollAngle_raw = 0; yawAngle_raw = 0;
     previous_pitchAngle_raw = 0; previous_rollAngle_raw = 0; previous_yawAngle_raw = 0; 
     rc_missing_count = 0;
+    alt_estimate = current_altitude;
+    vvel_estimate = 0;
+    bias = 0;
+    filtered_a_up_g = refG;
+    last_altitude_estimate = 0;
     
     master_state=STATE_ON;
   }else if(master_state==STATE_ON && engineSpeed<1040 && (MAX_RATE_SETPOINT_DPS +yawAngle ) <= 20 ){
@@ -743,9 +688,14 @@ void loop() {
     setAllEnginesSpeed(engineSpeed);
   }
 
-  if(alt_hold_mode){
-    readBarometer();
-  }
+  //Disable readings when not in alt-hold on NANO IOT as it introduce latency on the loop
+  #if defined(ARDUINO_NANO_ESP32) || defined(ARDUINO_ARCH_ESP32)
+    estimateAltitude();
+  #elif defined(ARDUINO_SAMD_NANO_33_IOT) || defined(ARDUINO_ARCH_SAMD)
+    if(alt_hold_mode){
+      estimateAltitude();
+    }
+  #endif
 
   #ifdef PRINT_PARAMETERS
     flightLog.rc_engine_speed = engineSpeed;
@@ -781,7 +731,8 @@ void loop() {
       //                                           flightLog.toogleSwitch,
       //                                           flightLog.rc_vspeed_raw,
       //                                           flightLog.a_net);
-      sprintf(buffer,"%f,%f,%f,%f,%f,%f,%d,%f,%f", 
+      sprintf(buffer,"%f,%f,%f,%f,%f,%f,%f,%d,%f,%f,%f,%d",
+                                                flightLog.altitude_raw,   
                                                 flightLog.altitude,
                                                 flightLog.alt_estimate,
                                                 flightLog.vertical_speed,
@@ -790,7 +741,10 @@ void loop() {
                                                 flightLog.altitude_setpoint,
                                                 flightLog.rc_engine_speed,
                                                 flightLog.rc_vspeed_raw,
-                                                flightLog.rc_vspeed_filtered);
+                                                flightLog.rc_vspeed_filtered,
+                                                flightLog.bias,
+                                                flightLog.toogle_altitude_hold
+                                                );
       Serial.println(buffer);
       log_timer = micros();
     }
@@ -1140,9 +1094,11 @@ void setupBarometerBoard(){
     bmp.enablePressure(true);
 
     bmp.configureInterrupt(BMP5XX_INTERRUPT_PULSED, BMP5XX_INTERRUPT_ACTIVE_HIGH, BMP5XX_INTERRUPT_PUSH_PULL, BMP5XX_INTERRUPT_DATA_READY, true);
+    
 
 
   #endif
+  calibrateGroundAltitude();
 }
 
 void setupBoard()
@@ -1305,22 +1261,22 @@ void getMotion(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int16_t* gy, 
     *ay = ((int16_t)buffer[8] | int16_t(buffer[9] << 8));
     *az = ((int16_t)buffer[10] | int16_t(buffer[11] << 8));
   #elif IMU_BOARD == ISM330DHCX_BOARD
-    // uint8_t buffer[12];
-    // // Start at register 0x22 (OUTX_L_G) and read 12 sequential bytes
-    // myISM.readRegisterRegion(0x22, buffer, 12);
+    uint8_t buffer[12];
+    // Start at register 0x22 (OUTX_L_G) and read 12 sequential bytes
+    myISM.readRegisterRegion(0x22, buffer, 12);
     
-    // // Combine the Low and High bytes using bitwise math (Little Endian format)
-    // // Gyro data comes first in the memory map
-    // // if (myISM.checkStatus()) {
-    //   *gx = ((int16_t)buffer[0] | int16_t(buffer[1] << 8)); 
-    //   *gy = ((int16_t)buffer[2] | int16_t(buffer[3] << 8));
-    //   *gz = ((int16_t)buffer[4] | int16_t(buffer[5] << 8)); 
+    // Combine the Low and High bytes using bitwise math (Little Endian format)
+    // Gyro data comes first in the memory map
+    // if (myISM.checkStatus()) {
+      *gx = ((int16_t)buffer[0] | int16_t(buffer[1] << 8)); 
+      *gy = ((int16_t)buffer[2] | int16_t(buffer[3] << 8));
+      *gz = ((int16_t)buffer[4] | int16_t(buffer[5] << 8)); 
       
-    //   // Accelerometer data immediately follows
-    //   *ax = ((int16_t)buffer[6] | int16_t(buffer[7] << 8));
-    //   *ay = ((int16_t)buffer[8] | int16_t(buffer[9] << 8));
-    //   *az = ((int16_t)buffer[10] | int16_t(buffer[11] << 8));
-    // // }
+      // Accelerometer data immediately follows
+      *ax = ((int16_t)buffer[6] | int16_t(buffer[7] << 8));
+      *ay = ((int16_t)buffer[8] | int16_t(buffer[9] << 8));
+      *az = ((int16_t)buffer[10] | int16_t(buffer[11] << 8));
+    // }
 
     // sensors_event_t accel, gyro, temp;
     // ism330dhcx.getEvent(&accel, &gyro, &temp);
@@ -1337,22 +1293,22 @@ void getMotion(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int16_t* gy, 
     // *ax = accel.acceleration.x / SENSORS_GRAVITY_STANDARD;
     // *ay = accel.acceleration.y / SENSORS_GRAVITY_STANDARD;
     // *az = accel.acceleration.z / SENSORS_GRAVITY_STANDARD;
-  sfe_ism_raw_data_t accelRaw; 
-  sfe_ism_raw_data_t gyroRaw;  
-  if (myISM.checkStatus()) {  
+  // sfe_ism_raw_data_t accelRaw; 
+  // sfe_ism_raw_data_t gyroRaw;  
+  // if (myISM.checkStatus()) {  
     
-    myISM.getRawGyro(&gyroRaw);
-    myISM.getRawAccel(&accelRaw); 
+  //   myISM.getRawGyro(&gyroRaw);
+  //   myISM.getRawAccel(&accelRaw); 
 
-    *ax = accelRaw.xData;
-    *ay = accelRaw.yData;
-    *az = accelRaw.zData;
+  //   *ax = accelRaw.xData;
+  //   *ay = accelRaw.yData;
+  //   *az = accelRaw.zData;
 
-    *gx = gyroRaw.xData;
-    *gy = gyroRaw.yData;
-    *gz = gyroRaw.zData;
+  //   *gx = gyroRaw.xData;
+  //   *gy = gyroRaw.yData;
+  //   *gz = gyroRaw.zData;
 
-  }
+  // }
   #endif
 }
 
@@ -1402,15 +1358,93 @@ bool isRCSignalLost(){
   return false;
 }
 
+void estimateAltitude(){
+    bool baro_read = false;
+    unsigned long current_altitude_estimate = micros();
+    float dt_baro=0;
+   
+    // Read barometer if available
+    if(readBarometer()){
+      unsigned long current_time = baro_isr_micros;
+      if(last_baro_read == 0) {
+        last_baro_read = current_time;
+        alt_estimate = current_altitude;
+        return;
+      }
+      dt_baro = (current_time - last_baro_read) / 1000000.0f;
+      last_baro_read = current_time;
+      baro_read = true;
+    }
+
+    // If first call initialize the last_altitude_estimate and the vvel_estimate
+    if(last_altitude_estimate==0)
+    {
+      last_altitude_estimate = current_altitude_estimate;
+      vvel_estimate = 0;
+    }
+    float dt_est_altitude = (current_altitude_estimate - last_altitude_estimate) / 1000000.0f;
+    last_altitude_estimate = current_altitude_estimate;
+
+    // filtered_altitude =  (filtered_altitude * 0.85) + (current_altitude * 0.15);
+    filtered_altitude = current_altitude;
+
+
+    // ---- Predict: integrate tilt-compensated vertical acceleration over dt_baro ----
+    // Rotates the body-frame accelerometer reading into the earth vertical axis using
+    // the current Madgwick pitch/roll, so the drone's own tilt isn't mistaken for climb/descent.
+    float pitch_rad = radians(ypr[1]);
+    float roll_rad  = radians(ypr[2])*-1;
+    float a_up_g =  ax_gf * (-sin(pitch_rad))
+                  + ay_gf * ( sin(roll_rad) * cos(pitch_rad))
+                  + az_gf * ( cos(roll_rad) * cos(pitch_rad));
+    // NOTE: verify this sign on the bench - az_gf should read ~+1.0g sitting level and still.
+    // If a_up_g reads ~-1.0g level instead, flip all three signs above.
+    // Checked it is around 1
+    filtered_a_up_g = (filtered_a_up_g * 0.7) + (a_up_g * 0.3);
+    // float a_net = (filtered_a_up_g - 1.0f) * 9.81f;  // strip gravity -> net vertical accel, m/s^2
+    float a_net = (filtered_a_up_g - refG) * 9.81f; 
+    // a_net-=refG;
+    #ifdef PRINT_PARAMETERS
+      flightLog.a_net = a_net;
+      // flightLog.raw_pressure= raw_pressure;
+    #endif
+    a_net-=bias;
+    bias = constrain(bias, -0.05f, 0.05f);
+    vvel_estimate += a_net * dt_est_altitude;
+    alt_estimate  += vvel_estimate * dt_est_altitude;
+
+    // If read baro fusion it with the estimator to smooth bias, this will run at 50hz
+    if(baro_read){
+      // ---- Correct: nudge the smooth-but-drifting accel estimate toward the noisy-but-
+      // ---- unbiased barometer reading. This is a multiply by a fixed gain, NOT a divide
+      // ---- by dt, which is what turned every bit of baro noise into m/s of fake velocity. ----
+      float alt_error = filtered_altitude - alt_estimate;
+      bias -= ALT_FUSION_KB * alt_error * dt_baro;
+      bias = constrain(bias, -0.05f, 0.05f);
+      flightLog.bias = bias;
+      alt_estimate  += ALT_FUSION_KP * alt_error; // CHECK THIS looks like the values are coming from the gyro as well
+      // vvel_estimate += ALT_FUSION_KV * alt_error * dt_baro;
+      vvel_estimate += (ALT_FUSION_KV * alt_error)  * dt_baro;
+    }
+
+    current_vertical_speed = vvel_estimate;
+    // current_vertical_speed = (current_vertical_speed * 0.85) + (baro_velocity * 0.15);
+    // current_vertical_speed = baro_velocity;
+    flightLog.altitude_raw = current_altitude;
+    flightLog.altitude = filtered_altitude;
+    flightLog.alt_estimate = alt_estimate;
+    flightLog.vertical_speed = current_vertical_speed;
+}
+
 bool readBarometer(bool force){
   float current_raw_altitude = 0;  
   if(baroDataReady || force){
     
     baroDataReady = false;
-    unsigned long current_time = baro_isr_micros;
+    
     
     #if BARO_BOARD == BARO_BMP388
-      current_raw_altitude =  bmp.readAltitudeM();
+      current_raw_altitude =  bmp.readAltitudeM() - ground_altitude;
       #ifdef PRINT_PARAMETERS
         raw_pressure = bmp.readPressPa() / 100;
         flightLog.raw_pressure= raw_pressure;
@@ -1423,67 +1457,13 @@ bool readBarometer(bool force){
       if (!bmp.performReading()) {
         return false;
       }
-      current_raw_altitude = bmp.readAltitude(SEALEVELPRESSURE_HPA);
+      current_raw_altitude = bmp.readAltitude(SEALEVELPRESSURE_HPA) - ground_altitude;
       #ifdef PRINT_PARAMETERS
         flightLog.raw_pressure= bmp.readPressure();
       #endif
     #endif
     
-    if (last_baro_read == 0) {
-      last_baro_read = current_time;
-      previous_altitude = current_raw_altitude;
-      alt_estimate = current_raw_altitude;
-      vvel_estimate = 0;
-      return false;
-    }
-    float dt_baro = (current_time - last_baro_read) / 1000000.0f;
-    last_baro_read = current_time;
-    if (dt_baro <= 0.001f) return false;
-    
     current_altitude = current_raw_altitude; // This to heavy for Arduino NANO IOT
-
-    // float raw_pressure = 0;
-    // current_altitude = (SEALEVELPRESSURE_PA - raw_pressure) / 8.3f;
-    // current_altitude = 0;
-
-    filtered_altitude =  (filtered_altitude * 0.85) + (current_altitude * 0.15);
-    // filtered_altitude =  (filtered_altitude * 0.7) + (current_altitude * 0.3);
-
-    // float baro_velocity = (filtered_altitude - previous_altitude) / dt_baro;
-    previous_altitude = filtered_altitude;
-
-        // ---- Predict: integrate tilt-compensated vertical acceleration over dt_baro ----
-    // Rotates the body-frame accelerometer reading into the earth vertical axis using
-    // the current Madgwick pitch/roll, so the drone's own tilt isn't mistaken for climb/descent.
-    float pitch_rad = radians(ypr[1]);
-    float roll_rad  = radians(ypr[2])*-1;
-    float a_up_g =  ax_gf * (-sin(pitch_rad))
-                  + ay_gf * ( sin(roll_rad) * cos(pitch_rad))
-                  + az_gf * ( cos(roll_rad) * cos(pitch_rad));
-    // NOTE: verify this sign on the bench - az_gf should read ~+1.0g sitting level and still.
-    // If a_up_g reads ~-1.0g level instead, flip all three signs above.
-    // Checked it is around 1
-    filtered_a_up_g = (filtered_a_up_g * 0.7) + (a_up_g * 0.3);
-    float a_net = (filtered_a_up_g - 1.0f) * 9.81f;  // strip gravity -> net vertical accel, m/s^2
-    #ifdef PRINT_PARAMETERS
-      flightLog.a_net = a_net;
-      // flightLog.raw_pressure= raw_pressure;
-    #endif
-
-    vvel_estimate += a_net * dt_baro;
-    alt_estimate  += vvel_estimate * dt_baro;
-
-    // ---- Correct: nudge the smooth-but-drifting accel estimate toward the noisy-but-
-    // ---- unbiased barometer reading. This is a multiply by a fixed gain, NOT a divide
-    // ---- by dt, which is what turned every bit of baro noise into m/s of fake velocity. ----
-    float alt_error = filtered_altitude - alt_estimate;
-    alt_estimate  += ALT_FUSION_KP * alt_error;
-    // vvel_estimate += ALT_FUSION_KV * alt_error;
-    vvel_estimate += (ALT_FUSION_KV * alt_error)  / dt_baro;
-
-    current_vertical_speed = vvel_estimate;
-    // current_vertical_speed = (current_vertical_speed * 0.85) + (baro_velocity * 0.15);
-    // current_vertical_speed = baro_velocity;
     baroDataReadDone=true;
     return true;
     
@@ -1491,7 +1471,11 @@ bool readBarometer(bool force){
     return false;
 }
 
+#if defined(ARDUINO_NANO_ESP32)
+void IRAM_ATTR baroISR()
+#else
 void baroISR()
+#endif
 {
     //  Serial.println("Barometer Ready");
     baro_isr_micros = micros();
@@ -1637,4 +1621,127 @@ void testEngines(){
 
 }
 
+
+void calibrateGroundAltitude(){
+  float current_raw_altitude = 0;
+  float altitude_sum = 0;
+  int samples = 50;
+  #if BARO_BOARD == BARO_BMP388
+    current_raw_altitude =  bmp.readAltitudeM();
+  #elif BARO_BOARD == BARO_BMP581
+    Serial.println(F("Calibrating ground altitude..."));
+    for (int i = 0; i < samples; i++) {
+      while(!bmp.dataReady()) {
+      }
+      while (!bmp.performReading()) {
+      }
+      altitude_sum += bmp.readAltitude(SEALEVELPRESSURE_HPA);
+    }
+  #endif
+  
+  ground_altitude = altitude_sum / samples;
+  Serial.print(F("Ground altitude calibrated: "));
+  Serial.println(ground_altitude);
+}
+
+void calibrateGRefOffset(){
+  float pitch_rad;
+  float roll_rad; 
+  float a_up_g = 0 ;
+
+  int samples = 50;
+  for (int i = 0; i < samples; i++) {
+    processIMUData();
+    pitch_rad = radians(ypr[1]);
+    roll_rad  = radians(ypr[2])*-1;
+    a_up_g +=  ax_gf * (-sin(pitch_rad))
+                  + ay_gf * ( sin(roll_rad) * cos(pitch_rad))
+                  + az_gf * ( cos(roll_rad) * cos(pitch_rad));
+    delay(3);
+  }
+  refG = a_up_g/samples;
+
+}
+
+void processIMUData(){
+  int16_t gx_raw, gy_raw, gz_raw;
+  int16_t ax_raw, ay_raw, az_raw;
+  getMotion(&ax_raw, &ay_raw, &az_raw,&gx_raw, &gy_raw, &gz_raw);
+
+  if (ax_raw == last_ax_raw && ay_raw == last_ay_raw && az_raw == last_az_raw) {
+    frozen_counter++;
+  } else {
+    frozen_counter = 0; // Reset counter if data changes
+  }
+
+  //Apply gyro offset
+  gx_raw-=gyro_offset[0];
+  gy_raw-=gyro_offset[1];
+  gz_raw-=gyro_offset[2]; 
+
+  //Apply accel offset
+  #if IMU_BOARD == LSM6DS3_BOARD || IMU_BOARD == ISM330DHCX_BOARD
+  ax_raw -= accel_offset[0];
+  ay_raw -= accel_offset[1];
+  az_raw -= accel_offset[2];
+  #endif
+
+  // Convert gyro raw data to degrees per second
+  gx_dps = gx_raw / GYRO_DIVISOR; 
+  gy_dps = gy_raw / GYRO_DIVISOR;
+  gz_dps = gz_raw / GYRO_DIVISOR;
+
+  // Convert accel raw data to g-force
+  ax_gf = ax_raw / 4096.0; 
+  ay_gf = ay_raw / 4096.0;
+  az_gf = az_raw / 4096.0;
+
+  // Apply sensor fusion using madgwick
+  #if IMU_BOARD == MPU6050_BOARD
+    if(frozen_counter >=3){ // Check if still needed, and how to detect the issue
+      resetWire();
+    }else{
+      filter.updateIMU(gx_dps,gy_dps,gz_dps,ax_gf,ay_gf,az_gf);
+    }
+    ypr[0] = filter.getYaw();
+    ypr[1] = filter.getPitch();
+    ypr[2] = filter.getRoll();
+    gy_dps *=-1;
+  #elif IMU_BOARD == LSM6DS3_BOARD
+    filter.updateIMU(gx_dps,gy_dps,gz_dps,ax_gf,ay_gf,az_gf);
+    ypr[0] = filter.getYaw() * -1;
+    ypr[1] = filter.getPitch();
+    ypr[2] = filter.getRoll() * -1;
+    gx_dps *=-1;
+  #elif IMU_BOARD == ISM330DHCX_BOARD
+    filter.updateIMU(gx_dps,gy_dps,gz_dps,ax_gf,ay_gf,az_gf);
+    ypr[0] = filter.getYaw() * -1;
+    ypr[1] = filter.getPitch();
+    ypr[2] = filter.getRoll()* -1;
+    gx_dps *=-1;
+  #endif
+
+  //Apply complementay filter on gyro data
+  if( ! (abs(gx_dps) > 400 || abs(gy_dps) > 400 || abs(gz_dps) > 400)  ){
+    gyro_filtered[0]= ( (0.7 * gyro_filtered[0])  + (0.3 * gx_dps) );
+    gyro_filtered[1]= ( (0.7 * gyro_filtered[1])  + (0.3 * gy_dps) );
+    gyro_filtered[2]= ( (0.7 * gyro_filtered[2])  + (0.3 * gz_dps) );
+
+  }
+  lastGoodPacket = millis();
+
+  last_ax_raw = ax_raw;
+  last_ay_raw = ay_raw;
+  last_az_raw = az_raw;
+
+  #ifdef PRINT_PARAMETERS
+    flightLog.gyro_pitch = gyro_filtered[1];
+    flightLog.gyro_roll = gyro_filtered[2];
+    flightLog.gyro_yaw = gyro_filtered[0];
+
+    flightLog.angle_pitch = ypr[1];
+    flightLog.angle_roll = ypr[2];
+    flightLog.angle_yaw = ypr[0];
+  #endif
+}
 
