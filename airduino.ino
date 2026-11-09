@@ -149,7 +149,7 @@ Evaluate list:
 */
 
 // #define DEBUG_MODE true
-#define PRINT_PARAMETERS true
+// #define PRINT_PARAMETERS true
 // #define TEST_ENGINES true
 
 
@@ -251,7 +251,7 @@ void dshotTask(void*);
         esc3.sendThrottle(escThrottle[2]);
         esc4.sendThrottle(escThrottle[3]);
         // vTaskDelay(1);            // ~1 kHz with the default 1000 Hz tick
-        vTaskDelay(20);            // ~1 kHz with the default 1000 Hz tick
+        vTaskDelay(2);            // ~1 kHz with the default 1000 Hz tick
       }
     }
 
@@ -288,8 +288,9 @@ int      pMin = 0, pMax = 0;
 uint32_t lastSwitchTick = 0;
 
 int engineSpeed = 1000;
-int engineSpeed_raw = 1000;
-int previous_engineSpeed_raw = 1000;
+int rfThrottle = 1000;
+int rfThrottle_raw = 1000;
+int previous_rfThrottle_raw = 1000;
 int master_state = STATE_OFF;
 bool alt_hold_mode = true, previous_alt_hold_mode = true;
 bool gyroCalibrationDone = false;
@@ -400,7 +401,7 @@ volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin h
 // Control
 float pitchAngle = 0, rollAngle=0, yawAngle=0, altitudeStick=0;
 float pitch_level_adjust = 0, roll_level_adjust = 0, yaw_level_adjust = 0;
-long pitchAngle_raw = 0, rollAngle_raw = 0, yawAngle_raw = 0 ;
+long pitchAngle_raw = 0, rollAngle_raw = 0, yawAngle_raw = 0, toogleMode_raw=0;
 float rc_vspeed_raw=0, previous_rc_vspeed_raw=0,rc_vspeed_filtered=0;
 long previous_pitchAngle_raw = 0, previous_rollAngle_raw = 0, previous_yawAngle_raw = 0 ;
 
@@ -569,20 +570,18 @@ void setup() {
 void loop() {
   buf="";
   processIMUData();
+  readRC();
 
   if(!isRCSignalLost()){
 
     // toogleSwitchRaw = rf_switch.getPulse();
     // flightLog.toogleSwitch = toogleSwitchRaw;
-    readToogles();
+    // readToogles();
     alt_hold_mode=toogle_altitude_hold;
     flightLog.toogle_altitude_hold=toogle_altitude_hold;
     
     if(alt_hold_mode && !previous_alt_hold_mode){
-      #if RC_TYPE == RC_ELRS
-      #else
-        pid_i_alt = constrain(rf_throttle.getPulse(), 1300, 1700);
-      #endif
+      pid_i_alt = constrain(rfThrottle, 1300, 1700);
       // last_baro_read = baro_isr_micros;
       // vvel_estimate = 0;
       // readBarometer(true);
@@ -595,7 +594,7 @@ void loop() {
     }
     if(!alt_hold_mode && previous_alt_hold_mode){
       engineSpeed = pid_i_alt;
-      previous_engineSpeed_raw = engineSpeed;
+      previous_rfThrottle_raw = engineSpeed;
       altitude_setpoint = alt_estimate;
     }
 
@@ -612,14 +611,14 @@ void loop() {
         // baroDataReadDone=false;
 
         if(alt_hold_mode && master_state == STATE_ON){
-          #if RC_TYPE == RC_ELRS
-          #else
-          rc_vspeed_raw = ((float)rf_throttle.mapDeadzone(-2000,2000, 0.2))/ 1000.0;
-          #endif
+          
+          rc_vspeed_raw = ((float)mapCrsfDeadzone(rfThrottle,1,0.3));
+          
           if(abs(rc_vspeed_raw - previous_rc_vspeed_raw) > 1.5){
             rc_vspeed_raw=previous_rc_vspeed_raw;
           }
-          rc_vspeed_filtered = (rc_vspeed_filtered*0.8) + (rc_vspeed_raw*0.2);
+          // rc_vspeed_filtered = (rc_vspeed_filtered*0.8) + (rc_vspeed_raw*0.2);
+          rc_vspeed_filtered = rc_vspeed_raw;
           flightLog.rc_vspeed_raw = rc_vspeed_raw;
           flightLog.rc_vspeed_filtered = rc_vspeed_filtered;
           
@@ -667,42 +666,17 @@ void loop() {
       }
       
     }else{
-      #if RC_TYPE == RC_ELRS
-      #else
-        engineSpeed_raw = rf_throttle.getPulse();
-      #endif
-      if(abs(engineSpeed_raw - previous_engineSpeed_raw) > 500){
-        engineSpeed_raw= previous_engineSpeed_raw;
-      }
-      engineSpeed = (0.8 * engineSpeed) +  (0.2 * engineSpeed_raw);
-    }
-    #if RC_TYPE == RC_ELRS
-    #else
-      pitchAngle_raw = rf_pitch.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1) *-1;
-      rollAngle_raw = rf_roll.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1);
-      yawAngle_raw = rf_yaw.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1);
-    #endif
-
-    if(abs(pitchAngle_raw - previous_pitchAngle_raw) > 60){
-      pitchAngle_raw = previous_pitchAngle_raw;
+      // #if RC_TYPE == RC_ELRS
+      // #else
+      //   engineSpeed_raw = rf_throttle.getPulse();
+      // #endif
+      // if(abs(engineSpeed_raw - previous_engineSpeed_raw) > 500){
+      //   engineSpeed_raw= previous_engineSpeed_raw;
+      // }
+      // engineSpeed = (0.8 * engineSpeed) +  (0.2 * engineSpeed_raw);
+      engineSpeed = rfThrottle;
     }
 
-    if(abs(rollAngle_raw - previous_rollAngle_raw) > 60){
-      rollAngle_raw = previous_rollAngle_raw;
-    }
-
-    if(abs(yawAngle_raw - previous_yawAngle_raw) > 60){
-      yawAngle_raw = previous_yawAngle_raw;
-    }
-
-    pitchAngle = (0.7 * pitchAngle) + (0.3 * pitchAngle_raw);
-    rollAngle = (0.7 * rollAngle) + (0.3 * rollAngle_raw);
-    yawAngle = (0.7 * yawAngle) + (0.3 * yawAngle_raw);
-
-    previous_pitchAngle_raw = pitchAngle_raw;
-    previous_rollAngle_raw = rollAngle_raw;
-    previous_yawAngle_raw = yawAngle_raw;
-    previous_engineSpeed_raw = engineSpeed_raw;
     flightLog.rcLost=false;
   }else{
     flightLog.rcLost=true;
@@ -728,8 +702,8 @@ void loop() {
     if(engineSpeed >= 1039) {
       if(rc_missing_count % 2 == 0){
         engineSpeed-=2;
-        engineSpeed_raw=engineSpeed;
-        previous_engineSpeed_raw=engineSpeed_raw;
+        rfThrottle_raw=engineSpeed;
+        previous_rfThrottle_raw=rfThrottle_raw;
       }
     }
   }
@@ -737,6 +711,12 @@ void loop() {
   readBatteryVoltage();
 
   //Master Switch control
+    // Serial.print("Ch1 (Roll): ");      Serial.print(rollAngle_raw);
+    // Serial.print(" | Ch2 (Pitch): ");   Serial.print(pitchAngle_raw);
+    // Serial.print(" | Ch3 (Throttle): ");Serial.print(engineSpeed_raw);
+    // Serial.print(" | Ch4 (Yaw): ");     Serial.print(yawAngle_raw);
+    // Serial.print(" | Ch10 (Toogle): ");     Serial.print(toogleMode_raw);
+    
   if(master_state==STATE_OFF && engineSpeed<1040 && (MAX_RATE_SETPOINT_DPS - yawAngle ) <= 20 ){
     stick_arm_count++;
     if(stick_arm_count>100){
@@ -779,12 +759,13 @@ void loop() {
   }else{
     stick_arm_count = 0;
   }
-
+  
   // Serial.printf("/n%d/n",engineSpeed);
   if( engineSpeed<1040 || master_state==STATE_OFF || master_state==STATE_STARTING ){
     // Serial.println("disabled");
     disableEngines();
   }else{
+    // crsf.setFlightMode("ARMED"); 
     // Serial.println("################");
     setAllEnginesSpeed(engineSpeed);
   }
@@ -1471,17 +1452,19 @@ void calibrateOffset(){
 
 bool isRCSignalLost(){
   #if RC_TYPE == RC_ELRS
+    return !crsf.isLinkUp();
   #else
     if(!rf_throttle.available()){
       rc_missing_count++;
     }else{
       rc_missing_count=0;
     }
-  #endif  
-  if(rc_missing_count > RC_MISSING_THRESHOLD){
-    return true;
-  }
-  return false;
+   
+    if(rc_missing_count > RC_MISSING_THRESHOLD){
+      return true;
+    }
+    return false;
+  #endif 
 }
 
 void estimateAltitude(){
@@ -1619,38 +1602,15 @@ uint8_t toogleBand(int p) {                 // same thresholds as readToogles()
   return 3;                             // both
 }
 
-
-void readToogles(){
-  uint32_t now = millis();
-  if (now - lastSwitchTick < 20) return;          // one sample per 20 ms
-  lastSwitchTick = now;
-  int p;
-  #if RC_TYPE == RC_ELRS
-  #else
-    if (!rf_switch.available()) { stableCount = 0; return; }
-    p = rf_switch.getPulse();
-  #endif
-  if (p < 900 || p > 2100)    { stableCount = 0; return; }   // invalid: ignore
-
-  uint8_t b = toogleBand(p);
-  if (b != candidateBand) {             // new band: restart the debounce
-    candidateBand = b; stableCount = 0; pMin = pMax = p;
-  } else {
-    if (p < pMin) pMin = p;
-    if (p > pMax) pMax = p;
-    if (pMax - pMin > 60) {             // not steady (ramping or noisy)
-      stableCount = 0; pMin = pMax = p;
-    } else if (stableCount < 255) {
-      stableCount++;
-    }
-  }
-
-  bool wantsAlt = (candidateBand == 1 || candidateBand == 3);
-  uint8_t need  = wantsAlt ? 10 : 3;    // slow on (200 ms), quick off (60 ms)
-  if (stableCount >= need) acceptedBand = candidateBand;
-
-  toogle_altitude_hold = (acceptedBand == 1 || acceptedBand == 3);
+uint8_t toogle3BandCRSF(int p) {                 // same thresholds as readToogles()
+  // Low Position (Raw: 1000)
+  if (p < 1300) return 0;
+  // Mid Position (Raw: 1503)
+  if (p < 1700) return 1; // alt-hold only  
+  // High Position (Raw: 2000)
+  return 2; //alternative mode
 }
+
 
 // Sends one compact binary telemetry packet over the HC-05 (Serial1). Format:
 //   byte 0-1:  sync 0xAA 0x55
@@ -1678,6 +1638,23 @@ void sendTelemetry() {
     crsfBatt.capacity = htobe24((uint32_t)(4000));        //mAh (24 bit field, max 16777215mAh)
     crsfBatt.remaining = (uint8_t)(100);                //percent
     crsf.queuePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_BATTERY_SENSOR, &crsfBatt, sizeof(crsfBatt));
+
+
+
+    crsf_sensor_baro_altitude_t crsfBaroAltitude = { 0 };
+
+    // Values are MSB first (BigEndian)
+    crsfBaroAltitude.altitude = htobe16((uint16_t)(alt_estimate *10.0 + 10000.0)); //decimeters + 10000dm
+    crsfBaroAltitude.verticalspd = htobe16((int16_t)(current_vertical_speed*100.0));     //cm/s
+    crsf.queuePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_BARO_ALTITUDE, &crsfBaroAltitude, sizeof(crsfBaroAltitude));
+
+    crsf_sensor_attitude_t crsfAttitude = { 0 };
+    crsfAttitude.pitch = htobe16((int16_t)(ypr[1]*10000.0));
+    crsfAttitude.roll = htobe16((int16_t)(ypr[2]*10000.0));
+    crsfAttitude.yaw = htobe16((int16_t)(ypr[0]*10000.0));
+    crsf.queuePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_ATTITUDE, &crsfAttitude, sizeof(crsfAttitude));
+
+
   #else
 
   uint8_t buf[29];
@@ -1916,10 +1893,130 @@ void processIMUData(){
 }
 
 void readRC(){
+  uint32_t now = millis();
   #if RC_TYPE == RC_ELRS
     crsf.update();
-    Serial.print(" | Ch3 (Throttle): ");Serial.print(crsf.getChannel(3));
+    rfThrottle_raw = crsf.getChannel(3);
+    pitchAngle_raw = (mapCrsfDeadzone(crsf.getChannel(2),MAX_RATE_SETPOINT_DPS,0.02))*-1;
+    rollAngle_raw = mapCrsfDeadzone(crsf.getChannel(1),MAX_RATE_SETPOINT_DPS,0.02);
+    yawAngle_raw = mapCrsfDeadzone(crsf.getChannel(4),MAX_RATE_SETPOINT_DPS,0.02);
+    // Channel 5 for arm-disarm
+    if(crsf.isLinkUp()){
+      toogleMode_raw = crsf.getChannel(9);
+    }else{
+      stableCount = 0;
+    }
+
+    if (now - lastSwitchTick >= 20){          // one sample per 20 ms
+
+      lastSwitchTick = now;
+      if (toogleMode_raw < 900 || toogleMode_raw > 2100)    { stableCount = 0; }   // invalid: ignore
+      if (toogleMode_raw < 900 || toogleMode_raw > 2100)    { stableCount = 0; }   // invalid: ignore
+
+      uint8_t b = toogle3BandCRSF(toogleMode_raw);
+
+
+      if (b != candidateBand) {             // new band: restart the debounce
+        candidateBand = b; stableCount = 0; pMin = pMax = toogleMode_raw;
+      } else {
+        if (toogleMode_raw < pMin) pMin = toogleMode_raw;
+        if (toogleMode_raw > pMax) pMax = toogleMode_raw;
+        if (pMax - pMin > 60) {             // not steady (ramping or noisy)
+          stableCount = 0; pMin = pMax = toogleMode_raw;
+        } else if (stableCount < 255) {
+          stableCount++;
+        }
+      }
+
+      bool wantsAlt = (candidateBand == 1 || candidateBand == 2);
+
+      uint8_t need  = wantsAlt ? 10 : 3;    // slow on (200 ms), quick off (60 ms)
+      if (stableCount >= need) acceptedBand = candidateBand;
+
+      toogle_altitude_hold = (acceptedBand == 1 || acceptedBand == 2);
+    }
+
+    rfThrottle = (0.5 * rfThrottle) +  (0.5 * rfThrottle_raw);
+    pitchAngle = (0.5 * pitchAngle) + (0.5 * pitchAngle_raw);
+    rollAngle = (0.5 * rollAngle) + (0.5 * rollAngle_raw);
+    yawAngle = (0.5 * yawAngle) + (0.5 * yawAngle_raw);
+
+ 
+
+    previous_pitchAngle_raw = pitchAngle_raw;
+    previous_rollAngle_raw = rollAngle_raw;
+    previous_yawAngle_raw = yawAngle_raw;
+    previous_rfThrottle_raw = rfThrottle_raw;
   #else
+  
+    rfThrottle_raw = rf_throttle.getPulse();
+    pitchAngle_raw = rf_pitch.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1) *-1;
+    rollAngle_raw = rf_roll.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1);
+    yawAngle_raw = rf_yaw.mapDeadzone(-MAX_RATE_SETPOINT_DPS, MAX_RATE_SETPOINT_DPS, 0.1);
+    if (rf_switch.available()){ 
+      toogleMode_raw = rf_switch.getPulse();
+    }else{
+      stableCount = 0;
+    }
+
+    if(abs(rfThrottle_raw - previous_rfThrottle_raw) > 500){
+      rfThrottle_raw= previous_rfThrottle_raw;
+    }
+
+    if(abs(pitchAngle_raw - previous_pitchAngle_raw) > 60){
+      pitchAngle_raw = previous_pitchAngle_raw;
+    }
+
+    if(abs(rollAngle_raw - previous_rollAngle_raw) > 60){
+      rollAngle_raw = previous_rollAngle_raw;
+    }
+
+    if(abs(yawAngle_raw - previous_yawAngle_raw) > 60){
+      yawAngle_raw = previous_yawAngle_raw;
+    }
+
+
+    if (now - lastSwitchTick >= 20){          // one sample per 20 ms
+      lastSwitchTick = now;
+      if (toogleMode_raw < 900 || toogleMode_raw > 2100)    { stableCount = 0; }   // invalid: ignore
+      if (toogleMode_raw < 900 || toogleMode_raw > 2100)    { stableCount = 0; }   // invalid: ignore
+
+      uint8_t b = toogleBand(toogleMode_raw);
+      if (b != candidateBand) {             // new band: restart the debounce
+        candidateBand = b; stableCount = 0; pMin = pMax = toogleMode_raw;
+      } else {
+        if (toogleMode_raw < pMin) pMin = toogleMode_raw;
+        if (toogleMode_raw > pMax) pMax = toogleMode_raw;
+        if (pMax - pMin > 60) {             // not steady (ramping or noisy)
+          stableCount = 0; pMin = pMax = toogleMode_raw;
+        } else if (stableCount < 255) {
+          stableCount++;
+        }
+      }
+
+      bool wantsAlt = (candidateBand == 1 || candidateBand == 3);
+      uint8_t need  = wantsAlt ? 10 : 3;    // slow on (200 ms), quick off (60 ms)
+      if (stableCount >= need) acceptedBand = candidateBand;
+
+      toogle_altitude_hold = (acceptedBand == 1 || acceptedBand == 3);
+    }
+
+    rfThrottle = (0.8 * rfThrottle) +  (0.2 * rfThrottle_raw);
+    pitchAngle = (0.7 * pitchAngle) + (0.3 * pitchAngle_raw);
+    rollAngle = (0.7 * rollAngle) + (0.3 * rollAngle_raw);
+    yawAngle = (0.7 * yawAngle) + (0.3 * yawAngle_raw);
+
+    previous_pitchAngle_raw = pitchAngle_raw;
+    previous_rollAngle_raw = rollAngle_raw;
+    previous_yawAngle_raw = yawAngle_raw;
+    previous_rfThrottle_raw = rfThrottle_raw;
   #endif
+}
+
+float mapCrsfDeadzone(float rawValue, float maxRate, float deadzone) {
+    float axis = (rawValue - 1500) / 500.0f;
+    if (axis > 1) axis = 1;
+    if (axis < -1) axis = -1;
+    return (axis > -deadzone && axis < deadzone) ? 0 : axis * maxRate;;    
 }
 
